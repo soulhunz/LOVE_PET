@@ -1,7 +1,10 @@
 {
-  "level": 3,
-  "xp": 6,
-  "hp": 1,
+  "level": 8,
+  "xp": 43,
+  "hp": 37.0,
   "fullness": 0,
-  "happy": 0
+  "happy": 0,
+  "wave_round": 1,
+  "wave_step": 5,
+  "character": "Sample"
 }

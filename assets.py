@@ -92,15 +92,47 @@ def _slice_sheet(sheet, count=None):
     return frames
 
 
+# โฟลเดอร์ที่ใช้ค้นไฟล์ภาพ เรียงตามลำดับความสำคัญ (ตั้งค่าได้ตอนรันด้วย set_character_dir)
+# ค่าเริ่มต้น = เฉพาะ ASSETS_DIR; ถ้าเลือกตัวละคร จะค้นโฟลเดอร์ตัวละครก่อน แล้วค่อย assets
+_search_dirs = None
+
+
+def set_character_dir(path):
+    """กำหนดโฟลเดอร์ตัวละครที่กำลังใช้ (ค้นก่อน assets/); path=None = ใช้ assets/ อย่างเดียว"""
+    global _search_dirs
+    _search_dirs = [path, config.ASSETS_DIR] if path else [config.ASSETS_DIR]
+
+
+def _dirs():
+    return _search_dirs if _search_dirs else [config.ASSETS_DIR]
+
+
+def character_path(name):
+    """เส้นทางโฟลเดอร์ของตัวละครชื่อ name"""
+    return os.path.join(config.CHARACTERS_DIR, name)
+
+
+def list_characters():
+    """คืนรายชื่อโฟลเดอร์ตัวละครใน characters/ (เรียงตามชื่อ); ไม่มีก็คืนลิสต์ว่าง"""
+    root = config.CHARACTERS_DIR
+    if not os.path.isdir(root):
+        return []
+    return sorted(d for d in os.listdir(root)
+                  if os.path.isdir(os.path.join(root, d)))
+
+
 def _resolve_path(name):
-    """หาไฟล์จริงของ candidate: ลองชื่อตรง ๆ ก่อน ถ้าไม่เจอ ลองชื่อที่มี marker
-    เช่น candidate 'pet_idle.png' -> เจอ 'pet_idle_strip4.png' ได้"""
-    direct = os.path.join(config.ASSETS_DIR, name)
-    if os.path.exists(direct):
-        return direct
+    """หาไฟล์จริงของ candidate ในโฟลเดอร์ที่ค้น (ตัวละครก่อน แล้ว assets):
+    ลองชื่อตรง ๆ ก่อน ถ้าไม่เจอ ลองชื่อที่มี marker เช่น 'pet_idle.png' -> 'pet_idle_strip4.png'"""
     base, ext = os.path.splitext(name)
-    matches = sorted(glob.glob(os.path.join(config.ASSETS_DIR, base + "_*" + ext)))
-    return matches[0] if matches else None
+    for d in _dirs():
+        direct = os.path.join(d, name)
+        if os.path.exists(direct):
+            return direct
+        matches = sorted(glob.glob(os.path.join(d, base + "_*" + ext)))
+        if matches:
+            return matches[0]
+    return None
 
 
 def load_sprite(candidates):

@@ -66,9 +66,10 @@ class Pet(Entity):
         self.hp = self.max_hp()
         self.fullness = 80.0
         self.happy = 80.0
-        self.behavior = "wander"   # wander | goto_food | fight | drag | ko
+        self.behavior = "wander"   # wander | stay | goto_food | fight | drag | ko
         self.vx = 0.0
         self.wtimer = 0            # ตัวจับเวลาสำหรับสุ่มพฤติกรรมเดินเล่น
+        self.stay_timer = 0        # ตัวจับเวลาสำหรับหันซ้าย-ขวาตอนยืนเฉย ๆ
         self.eat_timer = None
         self.attack_cd = 0
         self.ko_timer = 0
@@ -95,6 +96,8 @@ class Monster(Entity):
         super().__init__(canvas, anims, x, y, state="walk")
         self.max_hp = config.MONSTER_MAX_HP
         self.hp = self.max_hp
+        self.atk = config.MONSTER_ATTACK   # ดาเมจของมอนตัวนี้ (ตั้งจริงตอนเกิด)
+        self.is_boss = False               # เป็นบอสประจำเวฟหรือไม่
         self.attack_cd = 0
 
     def hp_ratio(self):

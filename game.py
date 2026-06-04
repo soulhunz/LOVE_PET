@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """โลกของ Desktop Pet: หน้าต่างโปร่งใสเต็มจอ + ลูปเกม + อินพุต + การต่อสู้"""
+import base64
 import ctypes
 from ctypes import wintypes
 import random
+import subprocess
 import tkinter as tk
 from tkinter import messagebox
 
@@ -110,6 +112,9 @@ class World:
         self.canvas.pack(fill="both", expand=True)
 
         # โหลดภาพ (ต้องทำหลังสร้าง root แล้ว)
+        # เลือกตัวละครที่บันทึกไว้ (ค้นไฟล์เพ็ทจากโฟลเดอร์ตัวละครก่อน assets/)
+        self.character = self._read_saved_character()
+        assets.set_character_dir(assets.character_path(self.character) if self.character else None)
         self.pet_forms = self._load_pet_forms()      # ทุกร่างของเพ็ท (Evolution)
         self.monster_anims = self._load_anims(config.MONSTER_SPRITES, "monster", config.MONSTER_SIZE)
         fa = assets.load_sprite(config.FOOD_SPRITES) or assets.build_fallback("food", config.FOOD_SIZE)
@@ -125,10 +130,15 @@ class World:
 
         self.monster = None
         self.food = None
+        # นับถอยหลัง (วินาที) จนกว่ามอนสเตอร์ตัวถัดไปจะสุ่มเกิดเอง
+        self.monster_spawn_in = random.randint(config.MONSTER_SPAWN_MIN_SEC,
+                                               config.MONSTER_SPAWN_MAX_SEC)
         self.effects = []          # [{"item":id, "ttl":int, "dy":float}]
         self.bubble_items = []
         self.bubble_ttl = 0
         self.show_hud = True          # แผงสถานะมุมขวาล่างของจอหลัก
+        self.hud_collapsed = False    # ย่อแผงให้เหลือแค่แท็บเล็ก ๆ (กดขยายได้)
+        self.menu_collapsed = False   # ย่อเมนูซ้าย (แยกจากแผง: กดเมนูจะไม่ขยายแผง)
         self.tick_count = 0
 
         # อินพุต
@@ -136,12 +146,40 @@ class World:
         self._dragged = False
         self._press_xy = (0, 0)
         self.canvas.tag_bind(self.pet.item, "<ButtonPress-1>", self.on_press)
+        # ปุ่มย่อ/ขยายแผงสถานะ (ผูกกับ tag — ใช้ได้กับไอเทมที่วาดใหม่ทุกเฟรม)
+        self.canvas.tag_bind("hud_toggle", "<Button-1>", self._on_hud_click)
+        self.canvas.tag_bind("hud_toggle", "<Enter>",
+                             lambda e: self.canvas.config(cursor="hand2"))
+        self.canvas.tag_bind("hud_toggle", "<Leave>",
+                             lambda e: self.canvas.config(cursor=""))
+        # ปุ่มเมนูซ้าย (ให้อาหาร / ลูบหัว / ไอคอน ☰ ตอนย่อ) + ปุ่ม 🐾 เปลี่ยนตัวละคร
+        for _tag in ("btn_feed", "btn_pat", "btn_menu", "btn_char"):
+            self.canvas.tag_bind(_tag, "<Enter>",
+                                 lambda e: self.canvas.config(cursor="hand2"))
+            self.canvas.tag_bind(_tag, "<Leave>",
+                                 lambda e: self.canvas.config(cursor=""))
+        self.canvas.tag_bind("btn_feed", "<Button-1>",
+                             lambda e: self._menu_click(self.feed))
+        self.canvas.tag_bind("btn_pat", "<Button-1>",
+                             lambda e: self._menu_click(self.pet_react))
+        self.canvas.tag_bind("btn_menu", "<Button-1>", self._on_menu_icon_click)
+        self.canvas.tag_bind("btn_char", "<Button-1>",
+                             lambda e: self._menu_click(self._cycle_character))
         self.root.bind("<B1-Motion>", self.on_drag)
         self.root.bind("<ButtonRelease-1>", self.on_release)
         self.root.bind("<Button-3>", self.on_menu)
         self.root.bind("<Escape>", lambda e: self.quit())
 
         self._build_menu()
+
+        # ซ่อนเพ็ทเมื่อมีโปรแกรมอื่นเปิดเต็มจอ (เกม/วิดีโอ fullscreen)
+        self.root.update_idletasks()
+        self._own_hwnds = self._collect_own_hwnds()
+        self.hidden_for_fullscreen = False
+
+        # การแจ้งเตือนหิว
+        self._was_hungry = False
+        self._last_hunger_notify = -1e9
 
     # ------------------------------------------------------------------ setup
     def _load_anims(self, spritemap, kind, size, color=None):
@@ -156,19 +194,56 @@ class World:
 
     def _load_pet_forms(self):
         """โหลดสไปรต์ของทุกร่างแปลงร่างตาม config.PET_EVOLUTIONS
-        แต่ละร่างใช้ไฟล์ชื่อ '{prefix}_{state}.gif/png' (state เดียวกับ PET_SPRITES)"""
+        แต่ละร่างใช้ไฟล์ '{prefix}_{state}.gif/png' (state เดียวกับ PET_SPRITES)
+        ถ้าร่างไหน 'ไม่มีไฟล์เลย' จะใช้ภาพของร่างก่อนหน้า (ตัวละครเดียวกัน) แทน
+        เพื่อให้ตัวละครที่ใส่แค่ pet_idle เห็นภาพนั้นได้ทุกเลเวล (ไม่กลายเป็นตัวสำรอง)"""
         states = list(config.PET_SPRITES.keys())
         forms = []
         for ev in config.PET_EVOLUTIONS:
             prefix = ev["prefix"]
-            spritemap = {s: [f"{prefix}_{s}.gif", f"{prefix}_{s}.png"] for s in states}
-            anims = self._load_anims(spritemap, "pet",
-                                     ev.get("size", config.PET_SIZE), ev.get("color"))
+            anims = {}
+            for s in states:
+                a = assets.load_sprite([f"{prefix}_{s}.gif", f"{prefix}_{s}.png"])
+                if a:
+                    anims[s] = a
+            if not anims:                       # ร่างนี้ไม่มีไฟล์เลย
+                if forms:                       # ใช้ภาพร่างก่อนหน้า (ตัวละครเดียวกัน)
+                    anims = forms[-1]["anims"]
+                else:                           # ร่างแรกก็ไม่มี -> วาดตัวสำรอง
+                    anims = {"idle": assets.build_fallback(
+                        "pet", ev.get("size", config.PET_SIZE), ev.get("color"))}
+            elif "idle" not in anims:           # มีบางสถานะแต่ขาด idle
+                anims["idle"] = assets.build_fallback(
+                    "pet", ev.get("size", config.PET_SIZE), ev.get("color"))
             forms.append({"level": ev["level"], "name": ev.get("name", prefix), "anims": anims})
         if not forms:   # สำรอง ถ้าไม่ได้ตั้ง PET_EVOLUTIONS ไว้
             anims = self._load_anims(config.PET_SPRITES, "pet", config.PET_SIZE)
             forms.append({"level": 1, "name": "pet", "anims": anims})
         return forms
+
+    def _read_saved_character(self):
+        """อ่านชื่อตัวละครที่บันทึกไว้ — คืน None ถ้าไม่มี/โฟลเดอร์หายไป (ใช้ assets/ ปกติ)"""
+        name = save.load().get("character")
+        return name if name and name in assets.list_characters() else None
+
+    def set_character(self, name):
+        """สลับตัวละคร: name = ชื่อโฟลเดอร์ใน characters/ หรือ None = ค่าเริ่มต้น (assets/)
+        โหลดสไปรต์เพ็ทใหม่ทั้งหมดแล้วใช้ร่างตามเลเวลปัจจุบัน"""
+        self.character = name
+        assets.set_character_dir(assets.character_path(name) if name else None)
+        self.pet_forms = self._load_pet_forms()
+        self._apply_pet_form(self._pet_form_for_level(self.pet.level))
+        self._save_progress()
+        self.show_bubble(f"เปลี่ยนตัวละคร: {name or 'ค่าเริ่มต้น'} ✨")
+
+    def _cycle_character(self):
+        """วนไปตัวละครถัดไป (ค่าเริ่มต้น → แต่ละโฟลเดอร์ → วนกลับ) — ใช้กับปุ่ม 🐾"""
+        options = [None] + assets.list_characters()
+        try:
+            i = options.index(self.character)
+        except ValueError:
+            i = 0
+        self.set_character(options[(i + 1) % len(options)])
 
     def _pet_form_for_level(self, level):
         """ดัชนีร่างสูงสุดที่ปลดล็อกได้ ณ เลเวลนี้"""
@@ -209,13 +284,32 @@ class World:
     def _build_menu(self):
         m = tk.Menu(self.root, tearoff=0)
         m.add_command(label="🍎  ให้อาหาร", command=self.feed)
-        m.add_command(label="⚔  ปล่อยมอนสเตอร์", command=self.spawn_monster)
         m.add_command(label="✋  ลูบหัว / เล่นด้วย", command=self.pet_react)
+        m.add_command(label="🧍  ยืนเฉย ๆ (หันไปมา)", command=self.toggle_stand)
         m.add_separator()
+        self.char_menu = tk.Menu(m, tearoff=0)     # เมนูย่อย "เปลี่ยนตัวละคร" (เติมรายชื่อตอนเปิด)
+        m.add_cascade(label="🎭  เปลี่ยนตัวละคร", menu=self.char_menu)
         m.add_command(label="📊  ดูสถานะ / เลเวล", command=self.show_status)
         m.add_command(label="🖥  เปิด/ปิด แผงสถานะ (มุมจอ)", command=self.toggle_hud)
         m.add_command(label="❌  ออกจากโปรแกรม", command=self.quit)
         self.menu = m
+
+    def _refresh_character_menu(self):
+        """เติมรายชื่อตัวละครใหม่ทุกครั้งที่เปิดเมนู (เพิ่มโฟลเดอร์แล้วเห็นทันที ไม่ต้องรีสตาร์ท)"""
+        cm = self.char_menu
+        cm.delete(0, "end")
+        check = "✓ "
+        cm.add_command(label=f"{check if self.character is None else '   '}ค่าเริ่มต้น (assets)",
+                       command=lambda: self.set_character(None))
+        chars = assets.list_characters()
+        if not chars:
+            cm.add_separator()
+            cm.add_command(label="(ยังไม่มีโฟลเดอร์ใน characters/)", state="disabled")
+            return
+        for name in chars:
+            mark = check if name == self.character else "   "
+            cm.add_command(label=f"{mark}{name}",
+                           command=lambda n=name: self.set_character(n))
 
     # ----------------------------------------------------------------- inputs
     def on_press(self, e):
@@ -246,6 +340,11 @@ class World:
             self.pet_react()                 # คลิกเฉย ๆ = โต้ตอบ
 
     def on_menu(self, e):
+        # ให้อาหารกดไม่ได้ตอนกำลังสู้ หรือสลบ
+        busy = self.monster is not None or self.pet.behavior == "ko"
+        self.menu.entryconfigure("🍎  ให้อาหาร",
+                                 state="disabled" if busy else "normal")
+        self._refresh_character_menu()
         try:
             self.menu.tk_popup(e.x_root, e.y_root)
         finally:
@@ -260,28 +359,100 @@ class World:
         self.add_xp(config.XP_PER_PET)
 
     def feed(self):
-        if self.food is not None or self.pet.behavior == "ko":
+        # กำลังสู้กับมอน/บอส → กินไม่ได้ (ต้องเคลียร์ศัตรูก่อน)
+        if self.monster is not None:
+            self.show_bubble("กำลังสู้อยู่ เดี๋ยวค่อยกิน! ⚔")
             return
-        x = random.uniform(self.sw * 0.15, self.sw * 0.85)
-        self.food = Food(self.canvas, self.food_anims, x, 0)
+        if self.pet.behavior == "ko" or self.food is not None:
+            return
+        # วางอาหารตรงตำแหน่งน้องแล้วกินทันที (ไม่ต้องเดินไปหา)
+        self.food = Food(self.canvas, self.food_anims, self.pet.x, 0)
         self._drop_to_ground(self.food)
         self.food.sync_position()
-        if self.pet.behavior != "fight":
-            self.pet.behavior = "goto_food"
+        self.pet.behavior = "goto_food"
+        self.pet.eat_timer = None
+
+    def _tick_spawn_monster(self):
+        """นับถอยหลังเพื่อให้มอนสเตอร์สุ่มเกิดเอง (เรียกทุก ~1 วินาที)"""
+        if self.monster is not None or self.pet.behavior in ("ko", "drag", "goto_food"):
+            return
+        self.monster_spawn_in -= 1
+        if self.monster_spawn_in <= 0:
+            self._spawn_monster()
+            self.monster_spawn_in = random.randint(config.MONSTER_SPAWN_MIN_SEC,
+                                                   config.MONSTER_SPAWN_MAX_SEC)
+
+    def _scaled_anims(self, anims, factor):
+        """คืนชุดอนิเมชันที่ขยายขนาด factor เท่า (จำนวนเต็ม) — ใช้ทำบอสตัวใหญ่"""
+        factor = max(1, int(factor))
+        if factor == 1:
+            return anims
+        out = {}
+        for state, anim in anims.items():
+            out[state] = assets.Animation([f.zoom(factor) for f in anim.frames])
+        return out
+
+    def _spawn_monster(self):
+        """สร้างมอนตัวถัดไปของเวฟ — HP/ATK สเกลตามเลเวลเพ็ท + เวฟ; ตัวที่ WAVE_LENGTH = บอส"""
+        is_boss = self.wave_step >= config.WAVE_LENGTH
+        # ขนาด/อนิเมชัน (บอสตัวใหญ่กว่า)
+        if is_boss:
+            anims = self._scaled_anims(self.monster_anims, config.BOSS_SIZE_MULT)
+            width = config.MONSTER_SIZE * config.BOSS_SIZE_MULT
+        else:
+            anims = self.monster_anims
+            width = config.MONSTER_SIZE
+
+        from_left = random.random() < 0.5
+        x = -width if from_left else self.sw + width
+        m = Monster(self.canvas, anims, x, 0)
+        m.is_boss = is_boss
+
+        # สเตตัสฐาน: ตามเลเวลเพ็ท แล้วคูณโบนัสเวฟ (เก่งขึ้นทุกเวฟ)
+        lvl = self.pet.level
+        round_mult = 1 + (self.wave_round - 1) * config.WAVE_STRENGTH_BONUS
+        base_hp = (config.MONSTER_MAX_HP + (lvl - 1) * config.MONSTER_HP_PER_LEVEL) * round_mult
+        base_atk = (config.MONSTER_ATTACK + (lvl - 1) * config.MONSTER_ATTACK_PER_LEVEL) * round_mult
+        if is_boss:
+            base_hp *= config.BOSS_HP_MULT
+            base_atk *= config.BOSS_ATK_MULT
+            m.max_hp = max(1, int(round(base_hp)))     # บอสไม่สุ่มแปรผัน (คงที่)
+            m.atk = max(1, int(round(base_atk)))
+        else:
+            v = config.MONSTER_STAT_VARIANCE
+            m.max_hp = max(1, int(round(base_hp * random.uniform(1 - v, 1 + v))))
+            m.atk = max(1, int(round(base_atk * random.uniform(1 - v, 1 + v))))
+        m.hp = m.max_hp
+
+        # ถ้ามีอาหารค้างอยู่ (กำลังกิน) ให้ยกเลิก เพราะต้องไปสู้ก่อน
+        if self.food is not None:
+            self.food.destroy()
+            self.food = None
             self.pet.eat_timer = None
 
-    def spawn_monster(self):
-        if self.monster is not None or self.pet.behavior == "ko":
-            return
-        from_left = random.random() < 0.5
-        x = -config.MONSTER_SIZE if from_left else self.sw + config.MONSTER_SIZE
-        self.monster = Monster(self.canvas, self.monster_anims, x, 0)
-        self.monster.max_hp = config.MONSTER_MAX_HP + (self.pet.level - 1) * config.MONSTER_HP_PER_LEVEL
-        self.monster.hp = self.monster.max_hp
-        self._drop_to_ground(self.monster)
-        self.monster.sync_position()
+        self.monster = m
+        self._drop_to_ground(m)
+        m.sync_position()
         self.pet.behavior = "fight"
-        self.show_bubble("มาสู้กัน!")
+        if is_boss:
+            self.show_bubble(f"👑 บอสเวฟ {self.wave_round} มาแล้ว!")
+        else:
+            self.show_bubble(f"⚔ มอนสเตอร์ ({self.wave_step}/{config.WAVE_LENGTH})")
+
+    def toggle_stand(self):
+        """สลับโหมด 'ยืนเฉย ๆ' (ไม่เดิน แต่หันซ้าย-ขวา) กับเดินเล่นปกติ"""
+        if self.pet.behavior == "ko":
+            return
+        if self.pet.behavior == "stay":
+            self.pet.behavior = "wander"
+            self.pet.vx = 0.0
+            self.show_bubble("เดินเล่นต่อ~ 🐾")
+        else:
+            self.pet.behavior = "stay"
+            self.pet.vx = 0.0
+            self.pet.set_state("idle")
+            self.pet.stay_timer = random.randint(40, 90)
+            self.show_bubble("ยืนเฉย ๆ 🧍")
 
     def toggle_hud(self):
         self.show_hud = not self.show_hud
@@ -313,6 +484,7 @@ class World:
         messagebox.showinfo(
             "สถานะของเพ็ท",
             f"ร่าง: {self.pet_forms[self.cur_form]['name']}\n"
+            f"เวฟ: {self.wave_round}  (มอนตัวที่ {self.wave_step}/{config.WAVE_LENGTH})\n"
             f"เลเวล: {p.level}\n"
             f"XP: {p.xp} / {p.xp_to_next()}\n"
             f"HP: {int(p.hp)} / {p.max_hp()}\n"
@@ -332,6 +504,8 @@ class World:
         self.pet.hp = min(hp, self.pet.max_hp())
         if self.pet.hp <= 0:
             self.pet.hp = self.pet.max_hp()
+        self.wave_round = max(1, int(data.get("wave_round", 1)))
+        self.wave_step = min(config.WAVE_LENGTH, max(1, int(data.get("wave_step", 1))))
 
     def _save_progress(self):
         p = self.pet
@@ -341,6 +515,9 @@ class World:
             "hp": round(p.hp, 1),
             "fullness": round(p.fullness, 1),
             "happy": round(p.happy, 1),
+            "wave_round": self.wave_round,
+            "wave_step": self.wave_step,
+            "character": self.character,
         })
 
     # ------------------------------------------------------------------ loops
@@ -356,8 +533,13 @@ class World:
 
     def _tick(self):
         self.tick_count += 1
+        # ทุก ~0.5 วิ: ซ่อน/แสดงเพ็ทตามว่ามีโปรแกรมอื่นเปิดเต็มจออยู่หรือไม่
+        if self.tick_count % max(1, int(500 / config.TICK_MS)) == 0:
+            self._update_fullscreen_visibility()
         if self.tick_count % max(1, int(1000 / config.TICK_MS)) == 0:
             self._decay_stats()
+            self._check_hunger()
+            self._tick_spawn_monster()
         if self.tick_count % max(1, int(1000 / config.TICK_MS) * 20) == 0:
             self._save_progress()   # เซฟอัตโนมัติทุก ~20 วินาที
 
@@ -367,6 +549,8 @@ class World:
             self._update_combat()
         elif self.pet.behavior == "goto_food" and self.food is not None:
             self._update_eating()
+        elif self.pet.behavior == "stay":
+            self._update_stay()
         elif self.pet.behavior == "drag":
             pass  # ตำแหน่งถูกคุมโดยเมาส์
         else:
@@ -376,6 +560,7 @@ class World:
         self._update_effects()
         self._update_bubble()
         self._draw_hud()
+        self._draw_monster_hud()
         self.root.after(config.TICK_MS, self._tick)
 
     # --------------------------------------------------------------- behaviors
@@ -423,6 +608,15 @@ class World:
         self.pet.set_state("walk" if self.pet.vx != 0 else "idle")
         self.pet.face(self.pet.vx)
 
+    def _update_stay(self):
+        """ยืนอยู่กับที่ ไม่เดินไปไหน แต่หันซ้าย-ขวาเป็นระยะ ๆ"""
+        self.pet.set_state("idle")
+        self._drop_to_ground(self.pet)
+        self.pet.stay_timer -= 1
+        if self.pet.stay_timer <= 0:
+            self.pet.face(-self.pet.facing)            # หันกลับด้าน
+            self.pet.stay_timer = random.randint(40, 110)
+
     def _update_eating(self):
         food = self.food
         if abs(food.x - self.pet.x) > 10:
@@ -464,28 +658,40 @@ class World:
             m.attack_cd = max(0, m.attack_cd - 1)
 
             if self.pet.attack_cd == 0:              # เพ็ทโจมตี
-                m.hp -= self.pet.attack()
+                dmg = self.pet.attack()
+                m.hp -= dmg
                 self.pet.set_state("attack")
-                self.spawn_effect(m.x, m.top_y(), "💥")
+                self.spawn_effect(m.x, m.top_y(), f"-{dmg}")
                 self.pet.attack_cd = config.ATTACK_COOLDOWN
             if m.attack_cd == 0:                     # มอนสเตอร์โจมตี
-                self.pet.hp -= config.MONSTER_ATTACK
+                self.pet.hp -= m.atk
                 self.pet.set_state("hurt")
                 self.pet.happy = max(0, self.pet.happy - 3)
-                self.spawn_effect(self.pet.x, self.pet.top_y(), "💢")
+                self.spawn_effect(self.pet.x, self.pet.top_y(), f"-{m.atk}")
                 m.attack_cd = config.ATTACK_COOLDOWN
 
         m.sync_position()
 
         if m.hp <= 0:                                # ชนะ
+            was_boss = m.is_boss
             self.spawn_effect(m.x, m.top_y(), "✨")
             m.destroy()
             self.monster = None
             self.pet.happy = min(100, self.pet.happy + 20)
             self.pet.behavior = "wander"
             self.pet.vx = 0
-            self.show_bubble("ชนะแล้ว! 🎉")
-            self.add_xp(config.XP_PER_WIN)
+            # คืบหน้าเวฟ: ล้มบอส = ขึ้นเวฟใหม่ (กลับไปนับ 1 แต่มอนเก่งขึ้น)
+            if was_boss:
+                self.wave_round += 1
+                self.wave_step = 1
+                self.show_bubble(f"🏆 ผ่านบอส! ขึ้นเวฟ {self.wave_round}")
+                self.spawn_effect(self.pet.x, self.pet.top_y(), "🎉")
+                self.add_xp(config.XP_PER_WIN * config.BOSS_XP_MULT)
+            else:
+                self.wave_step += 1
+                self.show_bubble(f"ชนะ! ({self.wave_step}/{config.WAVE_LENGTH}) 🎉")
+                self.add_xp(config.XP_PER_WIN)
+            self._save_progress()
         elif self.pet.hp <= 0:                       # เพ็ทแพ้ (สลบ ไม่ตายถาวร)
             self.pet.set_state("hurt")
             self.pet.behavior = "ko"
@@ -550,24 +756,119 @@ class World:
         pad = 6
         self.canvas.coords(rect, x0 - pad, y0 - pad, x1 + pad, y1 + pad)
 
+    def _on_hud_click(self, e):
+        """กดปุ่มบนแผง = สลับย่อ/ขยาย (เมนูซ้ายย่อ/ขยายตามแผงด้วย)"""
+        self.hud_collapsed = not self.hud_collapsed
+        self.menu_collapsed = self.hud_collapsed
+        self._draw_hud()
+        return "break"
+
+    def _menu_click(self, action):
+        """กดปุ่มเมนูซ้าย — สั่งงานแล้ววาดใหม่ทันที"""
+        action()
+        self._draw_hud()
+        return "break"
+
+    def _on_menu_icon_click(self, e):
+        """กดไอคอน ☰ = เปิดเฉพาะเมนูซ้าย (ไม่ขยายแผง bar)"""
+        self.menu_collapsed = False
+        self._draw_hud()
+        return "break"
+
+    def _draw_button(self, x0, y0, x1, y1, text, tag, enabled=True):
+        """วาดปุ่มกดบน canvas (ถ้า enabled=False จะเป็นสีจางและกดไม่ได้)"""
+        tags = ("hud", tag) if enabled else ("hud",)
+        self.canvas.create_rectangle(x0, y0, x1, y1,
+                                     fill="#2c3e50" if enabled else "#2a2a2a",
+                                     outline="#5a5a5a", width=2, tags=tags)
+        self.canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=text,
+                                 fill="#ffffff" if enabled else "#6a6a6a",
+                                 font=("Segoe UI", 12, "bold"), tags=tags)
+
     def _draw_hud(self):
         """แผงสถานะแบบติดมุมขวาล่างของ 'จอหลัก' (เห็นชัดเสมอ ไม่ติดตามเพ็ท)"""
         self.canvas.delete("hud")
         if not self.show_hud:
             return
         p = self.pet
-        panel_w, panel_h, margin = 300, 168, 18
+        margin = 18
         # มุมขวาล่างของจอหลัก; ใช้ขอบบน taskbar เป็นฐานล่าง (แผงจึงอยู่เหนือ taskbar)
         right = -self.vx0 + self.primary_w
         bottom = self._work_bottom_at(right - margin)
-        x1, y1 = right - margin, bottom - margin
-        x0, y0 = x1 - panel_w, y1 - panel_h
 
+        x1, y1 = right - margin, bottom - margin
+        panel_w, panel_h = 300, 168
+        tab_w, tab_h = 138, 36
+        bar_w = tab_w if self.hud_collapsed else panel_w   # กว้างเท่าแผง/แท็บที่กำลังโชว์
+        panel_top = y1 - (tab_h if self.hud_collapsed else panel_h)
+
+        # ---- ป้ายเวฟ: แยกจากแผง ลอยเหนือแผง กว้างเท่า bar ด้านล่าง (ทั้งตอนย่อ/ขยาย) ----
+        if self.monster is not None and self.monster.is_boss:
+            wave_text = f"⚔ เวฟ {self.wave_round}  ·  👑 บอส"
+        else:
+            wave_text = f"⚔ เวฟ {self.wave_round}  ·  {self.wave_step}/{config.WAVE_LENGTH}"
+        wbar_h, wgap = 30, 8
+        wbx0, wbx1 = x1 - bar_w, x1
+        wby1 = panel_top - wgap
+        wby0 = wby1 - wbar_h
+        self.canvas.create_rectangle(wbx0, wby0, wbx1, wby1, fill="#1e1e1e",
+                                     outline="#5a5a5a", width=3, tags="hud")
+        self.canvas.create_text((wbx0 + wbx1) / 2, (wby0 + wby1) / 2, text=wave_text,
+                                fill="#f1c40f", font=("Segoe UI", 12, "bold"), tags="hud")
+
+        # ---- เมนูซ้าย: อยู่นอกกล่อง bar ด้านซ้าย (มี state แยกจากแผง) ----
+        menu_gap = 12
+        mx1 = (x1 - bar_w) - menu_gap          # ขอบขวาของเมนู = ซ้ายของ bar เว้นระยะ
+        if self.menu_collapsed:
+            # ย่อ: เหลือไอคอน ☰ กดเพื่อเปิดเฉพาะเมนู (แผงไม่ขยาย)
+            self._draw_button(mx1 - 46, y1 - 44, mx1, y1, "☰", "btn_menu")
+        else:
+            mbw, mbh, mvgap = 140, 44, 8
+            mbx0 = mx1 - mbw
+            feed_on = self.monster is None and self.pet.behavior != "ko"
+            pat_on = self.pet.behavior != "ko"
+            # ลูบหัว (ล่าง ชิดฐานเดียวกับ bar) / ให้อาหาร (บน)
+            self._draw_button(mbx0, y1 - mbh, mx1, y1, "✋  ลูบหัว", "btn_pat", pat_on)
+            fy1 = y1 - mbh - mvgap
+            self._draw_button(mbx0, fy1 - mbh, mx1, fy1, "🍎  ให้อาหาร", "btn_feed", feed_on)
+
+        # ---- สถานะย่อ: เหลือแค่แท็บเล็ก ๆ กดเพื่อขยาย ----
+        if self.hud_collapsed:
+            x0, y0 = x1 - tab_w, panel_top
+            self.canvas.create_rectangle(x0, y0, x1, y1, fill="#1e1e1e",
+                                         outline="#5a5a5a", width=3,
+                                         tags=("hud", "hud_toggle"))
+            self.canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2,
+                                    text=f"🐾 Lv.{p.level}   ▸",
+                                    fill="#ffffff", font=("Segoe UI", 12, "bold"),
+                                    tags=("hud", "hud_toggle"))
+            return
+
+        # ---- สถานะขยายเต็ม ----
+        x0, y0 = x1 - panel_w, panel_top
         self.canvas.create_rectangle(x0, y0, x1, y1, fill="#1e1e1e",
                                      outline="#5a5a5a", width=3, tags="hud")
-        self.canvas.create_text(x0 + 18, y0 + 24, anchor="w",
-                                text=f"🐾 เพ็ท   Lv.{p.level}",
-                                fill="#ffffff", font=("Segoe UI", 15, "bold"), tags="hud")
+        # ปุ่ม 🐾 (กดเพื่อเปลี่ยนตัวละคร) + ชื่อตัวละคร + เลเวล
+        ib = 32
+        ibx0, iby0 = x0 + 12, y0 + 8
+        ibx1, iby1 = ibx0 + ib, iby0 + ib
+        self.canvas.create_rectangle(ibx0, iby0, ibx1, iby1, fill="#2c3e50",
+                                     outline="#888888", width=2, tags=("hud", "btn_char"))
+        self.canvas.create_text((ibx0 + ibx1) / 2, (iby0 + iby1) / 2, text="🐾",
+                                font=("Segoe UI Emoji", 15), tags=("hud", "btn_char"))
+        char_name = self.character or "เพ็ท"
+        self.canvas.create_text(ibx1 + 10, y0 + 24, anchor="w",
+                                text=f"{char_name}   Lv.{p.level}",
+                                fill="#ffffff", font=("Segoe UI", 14, "bold"), tags="hud")
+        # ปุ่มย่อ (มุมขวาบนของแผง)
+        btn = 24
+        bx1, by0 = x1 - 12, y0 + 12
+        bx0, by1 = bx1 - btn, by0 + btn
+        self.canvas.create_rectangle(bx0, by0, bx1, by1, fill="#3a3a3a",
+                                     outline="#777777", tags=("hud", "hud_toggle"))
+        self.canvas.create_text((bx0 + bx1) / 2, (by0 + by1) / 2, text="▾",
+                                fill="#ffffff", font=("Segoe UI", 12, "bold"),
+                                tags=("hud", "hud_toggle"))
         rows = [
             ("HP", p.alive_ratio(), "#e74c3c", f"{int(p.hp)}/{p.max_hp()}"),
             ("อิ่ม", p.fullness / 100.0, "#f39c12", f"{int(p.fullness)}"),
@@ -587,6 +888,146 @@ class World:
                                          cy + bar_h, fill=color, outline="", tags="hud")
             self.canvas.create_text(bar_x + bar_w / 2, cy + bar_h / 2, text=text,
                                     fill="#ffffff", font=("Segoe UI", 10, "bold"), tags="hud")
+
+    # ----------------------------------------------------------- hunger alert
+    def _check_hunger(self):
+        """ถ้าความอิ่มต่ำกว่าเกณฑ์ ให้แจ้งเตือน (เด้งทันทีตอนเริ่มหิว และเตือนซ้ำตามรอบ)"""
+        hungry = (self.pet.fullness < config.HUNGRY_THRESHOLD
+                  and self.pet.behavior != "ko")
+        now = self.tick_count * config.TICK_MS / 1000.0   # วินาทีโดยประมาณ
+        if hungry:
+            renotify = config.HUNGRY_RENOTIFY_SEC
+            due = renotify > 0 and (now - self._last_hunger_notify) >= renotify
+            if not self._was_hungry or due:
+                self._last_hunger_notify = now
+                self._notify_hungry()
+        self._was_hungry = hungry
+
+    def _notify_hungry(self):
+        self.notify("🍽 เพ็ทหิวแล้ว",
+                    "พามาหาอะไรกินหน่อยนะ 🐾  (คลิกขวาที่เพ็ท → ให้อาหาร)")
+        if not self.hidden_for_fullscreen:
+            self.show_bubble("หิวแล้ว... 🍽")
+
+    def notify(self, title, message):
+        """แจ้งเตือนผ่าน Windows toast — เห็นได้แม้กำลังเปิดโปรแกรมอื่นเต็มจอ
+        ใช้ PowerShell เรียก ToastNotificationManager (ไม่ต้องลงไลบรารีเพิ่ม)"""
+        def esc(s):
+            s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            return s.replace("'", "''")   # หนีเครื่องหมาย ' สำหรับสตริงใน PowerShell
+        xml = (f"<toast><visual><binding template=\"ToastGeneric\">"
+               f"<text>{esc(title)}</text><text>{esc(message)}</text>"
+               f"</binding></visual></toast>")
+        # AUMID ของ PowerShell — ใช้แล้ว toast แสดงได้โดยไม่ต้องลงทะเบียนแอป
+        aumid = "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe"
+        ps = (
+            "$ErrorActionPreference='SilentlyContinue';"
+            "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]|Out-Null;"
+            "[Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom,ContentType=WindowsRuntime]|Out-Null;"
+            "$x=New-Object Windows.Data.Xml.Dom.XmlDocument;"
+            f"$x.LoadXml('{xml}');"
+            "$t=New-Object Windows.UI.Notifications.ToastNotification $x;"
+            f"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{aumid}').Show($t);"
+        )
+        try:
+            b64 = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", b64],
+                creationflags=0x08000000,   # CREATE_NO_WINDOW (ไม่มีหน้าต่าง console เด้ง)
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+    # --------------------------------------------------- fullscreen detection
+    def _collect_own_hwnds(self):
+        """รวบรวม HWND ของหน้าต่างเราเอง ไว้ยกเว้นตอนตรวจ fullscreen"""
+        hwnds = set()
+        try:
+            hwnds.add(int(self.root.winfo_id()))
+        except Exception:
+            pass
+        try:
+            hwnds.add(int(self.root.wm_frame(), 16))
+        except Exception:
+            pass
+        return hwnds
+
+    def _foreground_is_fullscreen(self):
+        """True ถ้าหน้าต่างที่อยู่หน้าสุด (foreground) ครอบ 'เต็มจอ' พอดี
+        เช่น เกม/วิดีโอ fullscreen — เอาไว้ซ่อนเพ็ทไม่ให้ไปบัง
+        (หน้าต่างที่ขยายใหญ่สุด/maximize ปกติจะ 'ไม่' เต็มจอ เพราะยังเหลือ taskbar)"""
+        try:
+            user32 = ctypes.windll.user32
+            user32.GetForegroundWindow.restype = wintypes.HWND
+            user32.GetShellWindow.restype = wintypes.HWND
+            user32.MonitorFromWindow.restype = wintypes.HANDLE   # HMONITOR
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return False
+            if int(hwnd) in self._own_hwnds:
+                return False
+            if int(hwnd) == int(user32.GetShellWindow() or 0):
+                return False
+            # ข้ามเดสก์ท็อป (Progman / WorkerW)
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, buf, 256)
+            if buf.value in ("Progman", "WorkerW"):
+                return False
+            rect = wintypes.RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return False
+            hmon = user32.MonitorFromWindow(hwnd, 2)   # MONITOR_DEFAULTTONEAREST
+            mi = _MONITORINFO()
+            mi.cbSize = ctypes.sizeof(_MONITORINFO)
+            if not user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                return False
+            m = mi.rcMonitor   # ขอบจอจริง (ไม่ใช่ rcWork ที่หัก taskbar)
+            # ครอบเต็มจอจริง (เผื่อคลาด 1px)
+            return (rect.left <= m.left + 1 and rect.top <= m.top + 1 and
+                    rect.right >= m.right - 1 and rect.bottom >= m.bottom - 1)
+        except Exception:
+            return False
+
+    def _update_fullscreen_visibility(self):
+        fs = self._foreground_is_fullscreen()
+        if fs and not self.hidden_for_fullscreen:
+            self.hidden_for_fullscreen = True
+            self.root.withdraw()                       # ซ่อนทั้งหน้าต่าง
+        elif not fs and self.hidden_for_fullscreen:
+            self.hidden_for_fullscreen = False
+            self.root.deiconify()                      # แสดงกลับ
+            self.root.wm_attributes("-topmost", True)  # ย้ำให้อยู่บนสุดเหมือนเดิม
+
+    def _draw_monster_hud(self):
+        """บาร์ HP + ตัวเลข HP/ATK ลอยเหนือหัวมอนสเตอร์ (ตามตำแหน่งมอน)"""
+        self.canvas.delete("monhud")
+        m = self.monster
+        if m is None:
+            return
+        # บอส: บาร์กว้างกว่า สีทอง / มอนปกติ: บาร์แดง
+        bar_w, bar_h = (96, 9) if m.is_boss else (60, 7)
+        hp_color = "#f1c40f" if m.is_boss else "#e74c3c"
+        cx = m.x
+        y0 = m.top_y() - 16
+        x0 = cx - bar_w / 2
+        ratio = max(0.0, min(1.0, m.hp_ratio()))
+        self.canvas.create_rectangle(x0, y0, x0 + bar_w, y0 + bar_h,
+                                     fill="#3a3a3a", outline="#000000", tags="monhud")
+        self.canvas.create_rectangle(x0, y0, x0 + bar_w * ratio, y0 + bar_h,
+                                     fill=hp_color, outline="", tags="monhud")
+        # ตัวเลข HP / ATK (มีพื้นหลังเข้มให้อ่านง่ายบนทุกฉากหลัง)
+        label = (f"👑 บอส  HP {int(m.hp)}/{m.max_hp}  ATK {m.atk}" if m.is_boss
+                 else f"HP {int(m.hp)}/{m.max_hp}   ATK {m.atk}")
+        txt = self.canvas.create_text(cx, y0 - 9, text=label,
+                                      fill="#ffffff", font=("Segoe UI", 9, "bold"),
+                                      tags="monhud")
+        bx0, by0, bx1, by1 = self.canvas.bbox(txt)
+        pad = 3
+        bg = self.canvas.create_rectangle(bx0 - pad, by0 - pad, bx1 + pad, by1 + pad,
+                                          fill="#222222", outline="", tags="monhud")
+        self.canvas.tag_lower(bg, txt)
 
     def _entities(self):
         ents = [self.pet]
