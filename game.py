@@ -137,9 +137,10 @@ class World:
         self.effects = []          # [{"item":id, "ttl":int, "dy":float}]
         self.bubble_items = []
         self.bubble_ttl = 0
-        self.show_hud = True          # แผงสถานะมุมขวาล่างของจอหลัก
-        self.hud_collapsed = False    # ย่อแผงให้เหลือแค่แท็บเล็ก ๆ (กดขยายได้)
-        self.menu_collapsed = False   # ย่อเมนูซ้าย (แยกจากแผง: กดเมนูจะไม่ขยายแผง)
+        self.show_hud = True            # แสดงเมนูด้านขวาล่าง
+        self.show_status_panel = False  # 📊 กดเพื่อโชว์แผงสถานะ (เริ่มต้น: ซ่อน)
+        self.show_actions = False       # 🍎 กดเพื่อโชว์เมนูให้อาหาร/ลูบหัว
+        # self.combat_enabled ถูกตั้งใน _load_progress() (เรียกไปแล้วด้านบน)
         self.tick_count = 0
 
         # อินพุต
@@ -147,23 +148,21 @@ class World:
         self._dragged = False
         self._press_xy = (0, 0)
         self.canvas.tag_bind(self.pet.item, "<ButtonPress-1>", self.on_press)
-        # ปุ่มย่อ/ขยายแผงสถานะ (ผูกกับ tag — ใช้ได้กับไอเทมที่วาดใหม่ทุกเฟรม)
-        self.canvas.tag_bind("hud_toggle", "<Button-1>", self._on_hud_click)
-        self.canvas.tag_bind("hud_toggle", "<Enter>",
-                             lambda e: self.canvas.config(cursor="hand2"))
-        self.canvas.tag_bind("hud_toggle", "<Leave>",
-                             lambda e: self.canvas.config(cursor=""))
-        # ปุ่มบนแถบ: ให้อาหาร / ลูบหัว / ☰ เปิด-ปิดเมนู / 🐾 เปลี่ยนตัวละคร / ⚙ ตั้งค่า
-        for _tag in ("btn_feed", "btn_pat", "btn_menu", "btn_char", "btn_settings"):
+        # ปุ่มเมนูด้านขวา (วาดใหม่ทุกเฟรม จึงผูกกับ tag)
+        hud_btns = ("btn_status", "btn_actions", "btn_combat",
+                    "btn_feed", "btn_pat", "btn_char", "btn_settings")
+        for _tag in hud_btns:
             self.canvas.tag_bind(_tag, "<Enter>",
                                  lambda e: self.canvas.config(cursor="hand2"))
             self.canvas.tag_bind(_tag, "<Leave>",
                                  lambda e: self.canvas.config(cursor=""))
+        self.canvas.tag_bind("btn_status", "<Button-1>", self._toggle_status_panel)
+        self.canvas.tag_bind("btn_actions", "<Button-1>", self._toggle_actions)
+        self.canvas.tag_bind("btn_combat", "<Button-1>", self._toggle_combat)
         self.canvas.tag_bind("btn_feed", "<Button-1>",
                              lambda e: self._menu_click(self.feed))
         self.canvas.tag_bind("btn_pat", "<Button-1>",
                              lambda e: self._menu_click(self.pet_react))
-        self.canvas.tag_bind("btn_menu", "<Button-1>", self._toggle_feed_menu)
         self.canvas.tag_bind("btn_char", "<Button-1>",
                              lambda e: self._show_character_popup())
         self.canvas.tag_bind("btn_settings", "<Button-1>", self._on_settings_click)
@@ -404,6 +403,8 @@ class World:
 
     def _tick_spawn_monster(self):
         """นับถอยหลังเพื่อให้มอนสเตอร์สุ่มเกิดเอง (เรียกทุก ~1 วินาที)"""
+        if not getattr(self, "combat_enabled", True):
+            return                              # โหมดเลี้ยงอย่างเดียว: ไม่เกิดมอน
         if self.monster is not None or self.pet.behavior in ("ko", "drag", "goto_food"):
             return
         self.monster_spawn_in -= 1
@@ -536,6 +537,7 @@ class World:
             self.pet.hp = self.pet.max_hp()
         self.wave_round = max(1, int(data.get("wave_round", 1)))
         self.wave_step = min(config.WAVE_LENGTH, max(1, int(data.get("wave_step", 1))))
+        self.combat_enabled = bool(data.get("combat_enabled", True))
 
     def _save_progress(self):
         p = self.pet
@@ -547,6 +549,7 @@ class World:
             "happy": round(p.happy, 1),
             "wave_round": self.wave_round,
             "wave_step": self.wave_step,
+            "combat_enabled": self.combat_enabled,
             "character": self.character,
         })
 
@@ -786,21 +789,36 @@ class World:
         pad = 6
         self.canvas.coords(rect, x0 - pad, y0 - pad, x1 + pad, y1 + pad)
 
-    def _on_hud_click(self, e):
-        """กดปุ่มบนแผง = สลับย่อ/ขยายแผงสถานะ (อิสระจากเมนูให้อาหาร)"""
-        self.hud_collapsed = not self.hud_collapsed
+    def _toggle_status_panel(self, e):
+        """📊 เปิด/ปิดแผงสถานะ (ออกทางซ้าย)"""
+        self.show_status_panel = not self.show_status_panel
+        self._draw_hud()
+        return "break"
+
+    def _toggle_actions(self, e):
+        """🍎 เปิด/ปิดเมนูให้อาหาร–ลูบหัว"""
+        self.show_actions = not self.show_actions
+        self._draw_hud()
+        return "break"
+
+    def _toggle_combat(self, e):
+        """⚔/🛡 สลับโหมดต่อสู้ ↔ เลี้ยงอย่างเดียว"""
+        self.combat_enabled = not self.combat_enabled
+        if not self.combat_enabled and self.monster is not None:
+            self.monster.destroy()          # ปิดต่อสู้ = เอามอนสเตอร์ออกทันที
+            self.monster = None
+            if self.pet.behavior != "ko":
+                self.pet.behavior = "wander"
+                self.pet.vx = 0
+        self.show_bubble("⚔ เปิดโหมดต่อสู้!" if self.combat_enabled
+                         else "🛡 โหมดเลี้ยงอย่างเดียว")
+        self._save_progress()
         self._draw_hud()
         return "break"
 
     def _menu_click(self, action):
         """กดปุ่มเมนูซ้าย — สั่งงานแล้ววาดใหม่ทันที"""
         action()
-        self._draw_hud()
-        return "break"
-
-    def _toggle_feed_menu(self, e):
-        """กดปุ่ม ☰/✕ = เปิด/ปิดเมนูให้อาหาร–ลูบหัว (อิสระจากการย่อแผง)"""
-        self.menu_collapsed = not self.menu_collapsed
         self._draw_hud()
         return "break"
 
@@ -874,15 +892,29 @@ class World:
                                  fill="#ffffff" if enabled else "#6a6a6a",
                                  font=("Segoe UI", 12, "bold"), tags=tags)
 
-    def _draw_icon_button(self, x0, y0, x1, y1, icon, tag, enabled=True):
-        """วาดปุ่มแบบไอคอนล้วน (กระชับ ไม่มีข้อความ)"""
+    def _draw_icon_button(self, x0, y0, x1, y1, icon, tag, enabled=True,
+                          accent=False, accent_color="#2c7a51"):
+        """วาดปุ่มไอคอนล้วน; accent=True = ไฮไลต์ (กำลังเปิดอยู่)"""
         tags = ("hud", tag) if enabled else ("hud",)
-        self.canvas.create_rectangle(x0, y0, x1, y1,
-                                     fill="#2c3e50" if enabled else "#2a2a2a",
+        fill = "#2a2a2a" if not enabled else (accent_color if accent else "#2c3e50")
+        self.canvas.create_rectangle(x0, y0, x1, y1, fill=fill,
                                      outline="#5a5a5a", width=2, tags=tags)
         self.canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=icon,
                                  fill="#ffffff" if enabled else "#6a6a6a",
                                  font=("Segoe UI Emoji", 18), tags=tags)
+
+    def _draw_pill(self, xr, yc, text, color):
+        """ป้ายข้อความเล็ก พื้นเข้ม วางชิดขวาที่ตำแหน่ง (xr, yc)"""
+        t = self.canvas.create_text(xr - 10, yc, text=text, anchor="e",
+                                    fill=color, font=("Segoe UI", 11, "bold"),
+                                    tags="hud")
+        bb = self.canvas.bbox(t)
+        if bb:
+            bx0, by0, bx1, by1 = bb
+            r = self.canvas.create_rectangle(bx0 - 10, by0 - 5, bx1 + 6, by1 + 5,
+                                             fill="#1e1e1e", outline="#5a5a5a",
+                                             width=2, tags="hud")
+            self.canvas.tag_lower(r, t)
 
     def _draw_hud(self):
         """แผงสถานะแบบติดมุมขวาล่างของ 'จอหลัก' (เห็นชัดเสมอ ไม่ติดตามเพ็ท)"""
@@ -896,112 +928,93 @@ class World:
         bottom = self._work_bottom_at(right - margin)
 
         x1, y1 = right - margin, bottom - margin
-        panel_w, panel_h = 300, 168
-        tab_w, tab_h = panel_w, 36         # ตอนย่อ: กว้างเท่าตอนขยาย (สวยกว่า)
-        bar_w = tab_w if self.hud_collapsed else panel_w   # กว้างเท่าแผง/แท็บที่กำลังโชว์
-        panel_top = y1 - (tab_h if self.hud_collapsed else panel_h)
 
-        # ---- ปุ่มตั้งค่า ⚙ : มุมขวาล่างสุด อยู่ "นอกกล่อง" ทางขวาของแถบ ----
-        gear = 40
-        self.canvas.create_rectangle(x1 - gear, y1 - gear, x1, y1,
-                                     fill="#2c3e50", outline="#5a5a5a", width=2,
-                                     tags=("hud", "btn_settings"))
-        self.canvas.create_text(x1 - gear / 2, y1 - gear / 2, text="⚙",
-                                fill="#ffffff", font=("Segoe UI Emoji", 18),
-                                tags=("hud", "btn_settings"))
-        px1 = x1 - gear - 10           # ขอบขวาของแถบ/แผง = ซ้ายของปุ่มตั้งค่า
-        self._gear_canvas = (x1 - gear, y1 - gear, x1, y1)  # เก็บไว้วางเมนูตั้งค่าเหนือปุ่ม
+        # ===== คอลัมน์ปุ่มไอคอนแนวตั้ง (ชิดขวาล่าง เรียงขึ้นบน) =====
+        bw, gap = 44, 8
 
-        # ---- ป้ายเวฟ: ลอยเหนือแผง กว้างเท่า bar ด้านล่าง (ทั้งตอนย่อ/ขยาย) ----
-        if self.monster is not None and self.monster.is_boss:
-            wave_text = f"⚔ เวฟ {self.wave_round}  ·  👑 บอส"
+        def col_rect(i):                       # i=0 = ล่างสุด
+            btm = y1 - i * (bw + gap)
+            return (x1 - bw, btm - bw, x1, btm)
+
+        sx0, sy0, sx1, sy1 = col_rect(0)       # ⚙ ตั้งค่า
+        cx0, cy0, cx1, cy1 = col_rect(1)       # ⚔ ต่อสู้
+        ax0, ay0, ax1, ay1 = col_rect(2)       # 🍎 เลี้ยง
+        tx0, ty0, tx1, ty1 = col_rect(3)       # 📊 สถานะ
+
+        self._draw_icon_button(tx0, ty0, tx1, ty1, "📊", "btn_status",
+                               accent=self.show_status_panel)
+        self._draw_icon_button(ax0, ay0, ax1, ay1, "🍎", "btn_actions",
+                               accent=self.show_actions)
+        self._draw_icon_button(cx0, cy0, cx1, cy1,
+                               "⚔" if self.combat_enabled else "🛡", "btn_combat",
+                               accent=self.combat_enabled, accent_color="#c0392b")
+        self._draw_icon_button(sx0, sy0, sx1, sy1, "⚙", "btn_settings")
+        self._gear_canvas = (sx0, sy0, sx1, sy1)   # ไว้วางเมนูตั้งค่าเหนือปุ่ม
+
+        # ===== ป้ายเวฟ/โหมด: ซ้ายของปุ่ม ⚔ (แสดงจำนวนเวฟ) =====
+        if self.combat_enabled:
+            if self.monster is not None and self.monster.is_boss:
+                wtext = f"⚔ เวฟ {self.wave_round} · 👑 บอส"
+            else:
+                wtext = f"⚔ เวฟ {self.wave_round} · {self.wave_step}/{config.WAVE_LENGTH}"
+            wcolor = "#f1c40f"
         else:
-            wave_text = f"⚔ เวฟ {self.wave_round}  ·  {self.wave_step}/{config.WAVE_LENGTH}"
-        wbar_h, wgap = 30, 8
-        wbx0, wbx1 = px1 - bar_w, px1
-        wby1 = panel_top - wgap
-        wby0 = wby1 - wbar_h
-        self.canvas.create_rectangle(wbx0, wby0, wbx1, wby1, fill="#1e1e1e",
-                                     outline="#5a5a5a", width=3, tags="hud")
-        self.canvas.create_text((wbx0 + wbx1) / 2, (wby0 + wby1) / 2, text=wave_text,
-                                fill="#f1c40f", font=("Segoe UI", 12, "bold"), tags="hud")
+            wtext, wcolor = "🛡 โหมดเลี้ยง", "#9aa0a6"
+        self._draw_pill(cx0 - 10, (cy0 + cy1) / 2, wtext, wcolor)
 
-        # ---- เมนูให้อาหาร/ลูบหัว: ไอคอนล้วน กระชับ + ปุ่ม ☰/✕ เปิด-ปิด (นอกกล่องซ้าย) ----
-        menu_gap = 12
-        mx1 = (px1 - bar_w) - menu_gap          # ขอบขวาของเมนู = ซ้ายของ bar เว้นระยะ
-        ib, vgap = 40, 6                         # ปุ่มไอคอน 40x40 ช่องไฟ 6 (กระชับ)
-        # ปุ่มสลับเปิด/ปิดเมนู — อยู่ล่างสุดเสมอ ฐานเดียวกับแถบ
-        self._draw_icon_button(mx1 - ib, y1 - ib, mx1, y1,
-                               "☰" if self.menu_collapsed else "✕", "btn_menu")
-        if not self.menu_collapsed:
+        # ===== 🍎 เมนูเลี้ยง: ไอคอน ✋/🍎 ออกซ้ายจากปุ่ม (แถวเดียวกัน) =====
+        if self.show_actions:
             feed_on = self.monster is None and self.pet.behavior != "ko"
             pat_on = self.pet.behavior != "ko"
-            py1 = y1 - ib - vgap                # เหนือปุ่มสลับ: ✋ ลูบหัว
-            self._draw_icon_button(mx1 - ib, py1 - ib, mx1, py1, "✋", "btn_pat", pat_on)
-            fy1 = py1 - ib - vgap               # บนสุด: 🍎 ให้อาหาร
-            self._draw_icon_button(mx1 - ib, fy1 - ib, mx1, fy1, "🍎", "btn_feed", feed_on)
+            self._draw_icon_button(ax0 - 12 - bw, ay0, ax0 - 12, ay1,
+                                   "✋", "btn_pat", enabled=pat_on)
+            self._draw_icon_button(ax0 - 12 - 2 * bw - gap, ay0,
+                                   ax0 - 12 - bw - gap, ay1,
+                                   "🍎", "btn_feed", enabled=feed_on)
 
-        # ---- สถานะย่อ: เหลือแค่แท็บเล็ก ๆ กดเพื่อขยาย ----
-        if self.hud_collapsed:
-            x0, y0 = px1 - tab_w, panel_top
-            self.canvas.create_rectangle(x0, y0, px1, y1, fill="#1e1e1e",
-                                         outline="#5a5a5a", width=3,
-                                         tags=("hud", "hud_toggle"))
+        # ===== 📊 แผงสถานะ: ป๊อปอัปออกซ้ายจากปุ่ม 📊 (เรียงขึ้นบน) =====
+        if self.show_status_panel:
+            pw, ph = 300, 168
+            qx1 = tx0 - 12
+            qx0 = qx1 - pw
+            qy1 = ty1
+            qy0 = qy1 - ph
+            self.canvas.create_rectangle(qx0, qy0, qx1, qy1, fill="#1e1e1e",
+                                         outline="#5a5a5a", width=3, tags="hud")
+            ib = 32
+            ibx0, iby0 = qx0 + 14, qy0 + 12
+            ibx1, iby1 = ibx0 + ib, iby0 + ib
+            self.canvas.create_rectangle(ibx0, iby0, ibx1, iby1, fill="#2c3e50",
+                                         outline="#888888", width=2,
+                                         tags=("hud", "btn_char"))
+            self.canvas.create_text((ibx0 + ibx1) / 2, (iby0 + iby1) / 2, text="🐾",
+                                    font=("Segoe UI Emoji", 15), tags=("hud", "btn_char"))
             char_name = self.character or "เพ็ท"
-            self.canvas.create_text(x0 + 16, (y0 + y1) / 2, anchor="w",
-                                    text=f"🐾 {char_name}   Lv.{p.level}",
-                                    fill="#ffffff", font=("Segoe UI", 12, "bold"),
-                                    tags=("hud", "hud_toggle"))
-            self.canvas.create_text(px1 - 16, (y0 + y1) / 2, anchor="e",
-                                    text="▸ ขยาย", fill="#9aa0a6",
-                                    font=("Segoe UI", 11),
-                                    tags=("hud", "hud_toggle"))
-            return
-
-        # ---- สถานะขยายเต็ม ----
-        x0, y0 = px1 - panel_w, panel_top
-        self.canvas.create_rectangle(x0, y0, px1, y1, fill="#1e1e1e",
-                                     outline="#5a5a5a", width=3, tags="hud")
-        # ปุ่ม 🐾 (กดเพื่อเปลี่ยนตัวละคร) + ชื่อตัวละคร + เลเวล
-        ib = 32
-        ibx0, iby0 = x0 + 12, y0 + 8
-        ibx1, iby1 = ibx0 + ib, iby0 + ib
-        self.canvas.create_rectangle(ibx0, iby0, ibx1, iby1, fill="#2c3e50",
-                                     outline="#888888", width=2, tags=("hud", "btn_char"))
-        self.canvas.create_text((ibx0 + ibx1) / 2, (iby0 + iby1) / 2, text="🐾",
-                                font=("Segoe UI Emoji", 15), tags=("hud", "btn_char"))
-        char_name = self.character or "เพ็ท"
-        self.canvas.create_text(ibx1 + 10, y0 + 24, anchor="w",
-                                text=f"{char_name}   Lv.{p.level}",
-                                fill="#ffffff", font=("Segoe UI", 14, "bold"), tags="hud")
-        # ปุ่มย่อ (มุมขวาบนของแผง)
-        btn = 24
-        bx1, by0 = px1 - 12, y0 + 12
-        bx0, by1 = bx1 - btn, by0 + btn
-        self.canvas.create_rectangle(bx0, by0, bx1, by1, fill="#3a3a3a",
-                                     outline="#777777", tags=("hud", "hud_toggle"))
-        self.canvas.create_text((bx0 + bx1) / 2, (by0 + by1) / 2, text="▾",
-                                fill="#ffffff", font=("Segoe UI", 12, "bold"),
-                                tags=("hud", "hud_toggle"))
-        rows = [
-            ("HP", p.alive_ratio(), "#e74c3c", f"{int(p.hp)}/{p.max_hp()}"),
-            ("อิ่ม", p.fullness / 100.0, "#f39c12", f"{int(p.fullness)}"),
-            ("สุข", p.happy / 100.0, "#e84393", f"{int(p.happy)}"),
-            ("XP", p.xp_ratio(), "#3498db", f"{p.xp}/{p.xp_to_next()}"),
-        ]
-        bar_x = x0 + 60
-        bar_w = panel_w - 60 - 18
-        bar_h = 16
-        for i, (label, ratio, color, text) in enumerate(rows):
-            cy = y0 + 52 + i * 28
-            self.canvas.create_text(x0 + 18, cy + bar_h / 2, anchor="w", text=label,
-                                    fill="#dddddd", font=("Segoe UI", 11), tags="hud")
-            self.canvas.create_rectangle(bar_x, cy, bar_x + bar_w, cy + bar_h,
-                                         fill="#3a3a3a", outline="", tags="hud")
-            self.canvas.create_rectangle(bar_x, cy, bar_x + bar_w * max(0, min(1, ratio)),
-                                         cy + bar_h, fill=color, outline="", tags="hud")
-            self.canvas.create_text(bar_x + bar_w / 2, cy + bar_h / 2, text=text,
-                                    fill="#ffffff", font=("Segoe UI", 10, "bold"), tags="hud")
+            self.canvas.create_text(ibx1 + 12, qy0 + 28, anchor="w",
+                                    text=f"{char_name}   Lv.{p.level}",
+                                    fill="#ffffff", font=("Segoe UI", 14, "bold"),
+                                    tags="hud")
+            rows = [
+                ("HP", p.alive_ratio(), "#e74c3c", f"{int(p.hp)}/{p.max_hp()}"),
+                ("อิ่ม", p.fullness / 100.0, "#f39c12", f"{int(p.fullness)}"),
+                ("สุข", p.happy / 100.0, "#e84393", f"{int(p.happy)}"),
+                ("XP", p.xp_ratio(), "#3498db", f"{p.xp}/{p.xp_to_next()}"),
+            ]
+            bar_x = qx0 + 60
+            bar_w = pw - 60 - 18
+            bar_h = 16
+            for i, (label, ratio, color, text) in enumerate(rows):
+                cy = qy0 + 56 + i * 28
+                self.canvas.create_text(qx0 + 18, cy + bar_h / 2, anchor="w", text=label,
+                                        fill="#dddddd", font=("Segoe UI", 11), tags="hud")
+                self.canvas.create_rectangle(bar_x, cy, bar_x + bar_w, cy + bar_h,
+                                             fill="#3a3a3a", outline="", tags="hud")
+                self.canvas.create_rectangle(bar_x, cy,
+                                             bar_x + bar_w * max(0, min(1, ratio)),
+                                             cy + bar_h, fill=color, outline="", tags="hud")
+                self.canvas.create_text(bar_x + bar_w / 2, cy + bar_h / 2, text=text,
+                                        fill="#ffffff", font=("Segoe UI", 10, "bold"),
+                                        tags="hud")
 
     # ----------------------------------------------------------- hunger alert
     def _check_hunger(self):
