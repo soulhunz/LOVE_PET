@@ -1,9 +1,9 @@
 @echo off
-title LOVE_PET - Update
+title LOVE_PET - Update (get server / main)
 cd /d "%~dp0"
 
 echo ============================================
-echo      LOVE_PET - Update (safe)
+echo   LOVE_PET - Update  (pull server version = main)
 echo ============================================
 echo.
 
@@ -21,31 +21,36 @@ powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $
 REM ---------- Protect runtime save ----------
 if exist save.json copy /y save.json save.json.bak >nul
 
-REM ---------- SAFETY: never destroy unpublished local code edits ----------
+REM ---------- SAFETY: never destroy uncommitted code edits ----------
 git update-index -q --refresh >nul 2>&1
 git diff-index --quiet HEAD --
 if errorlevel 1 (
   echo.
-  echo [!] You have local code changes that are NOT on GitHub yet.
-  echo     Update was CANCELLED so your work is NOT lost.
-  echo     To upload your changes first, run:  publish.bat
+  echo [!] You have uncommitted changes on this branch.
+  echo     Update CANCELLED so nothing is lost.
+  echo     Save your work first:  publish.bat   ^(or release.bat^)
   echo.
   if exist save.json.bak del save.json.bak >nul
   pause
   exit /b 1
 )
 
-REM ---------- Pull latest (fast-forward only = never discards commits) ----------
-echo [..] Pulling latest code from GitHub...
-for /f "delims=" %%b in ('git rev-parse --abbrev-ref HEAD') do set "BR=%%b"
+REM ---------- Switch to server branch (main) and pull latest ----------
+echo [..] Switching to server version (main)...
 git fetch origin
-git merge --ff-only origin/%BR%
+git checkout main
+if errorlevel 1 (
+  echo [X] Could not switch to main branch.
+  if exist save.json.bak copy /y save.json.bak save.json >nul & del save.json.bak >nul
+  pause
+  exit /b 1
+)
+git merge --ff-only origin/main
 if errorlevel 1 (
   echo.
-  echo [!] Cannot fast-forward (local and GitHub have diverged).
-  echo     Nothing was changed. Run publish.bat to upload local commits.
-  if exist save.json.bak copy /y save.json.bak save.json >nul
-  if exist save.json.bak del save.json.bak >nul
+  echo [!] Cannot fast-forward main (it has diverged from GitHub).
+  echo     Nothing was changed. Use release.bat / publish.bat to sync.
+  if exist save.json.bak copy /y save.json.bak save.json >nul & del save.json.bak >nul
   pause
   exit /b 1
 )
@@ -56,7 +61,7 @@ if exist save.json.bak (
   del save.json.bak >nul
 )
 
-echo [OK] Updated. Latest version:
+echo [OK] Now running SERVER version (main). Latest:
 git log -1 --oneline
 echo.
 echo [..] Relaunching pet...
