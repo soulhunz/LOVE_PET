@@ -3,6 +3,7 @@
 import base64
 import ctypes
 from ctypes import wintypes
+import os
 import random
 import subprocess
 import tkinter as tk
@@ -152,8 +153,8 @@ class World:
                              lambda e: self.canvas.config(cursor="hand2"))
         self.canvas.tag_bind("hud_toggle", "<Leave>",
                              lambda e: self.canvas.config(cursor=""))
-        # ปุ่มเมนูซ้าย (ให้อาหาร / ลูบหัว / ไอคอน ☰ ตอนย่อ) + ปุ่ม 🐾 เปลี่ยนตัวละคร
-        for _tag in ("btn_feed", "btn_pat", "btn_menu", "btn_char"):
+        # ปุ่มบนแถบ: ให้อาหาร / ลูบหัว / ☰ เปิด-ปิดเมนู / 🐾 เปลี่ยนตัวละคร / ⚙ ตั้งค่า
+        for _tag in ("btn_feed", "btn_pat", "btn_menu", "btn_char", "btn_settings"):
             self.canvas.tag_bind(_tag, "<Enter>",
                                  lambda e: self.canvas.config(cursor="hand2"))
             self.canvas.tag_bind(_tag, "<Leave>",
@@ -162,9 +163,10 @@ class World:
                              lambda e: self._menu_click(self.feed))
         self.canvas.tag_bind("btn_pat", "<Button-1>",
                              lambda e: self._menu_click(self.pet_react))
-        self.canvas.tag_bind("btn_menu", "<Button-1>", self._on_menu_icon_click)
+        self.canvas.tag_bind("btn_menu", "<Button-1>", self._toggle_feed_menu)
         self.canvas.tag_bind("btn_char", "<Button-1>",
                              lambda e: self._menu_click(self._cycle_character))
+        self.canvas.tag_bind("btn_settings", "<Button-1>", self._on_settings_click)
         self.root.bind("<B1-Motion>", self.on_drag)
         self.root.bind("<ButtonRelease-1>", self.on_release)
         self.root.bind("<Button-3>", self.on_menu)
@@ -282,17 +284,20 @@ class World:
         ent.y = self._ground_y(ent.x) - ent.current_anim().h / 2
 
     def _build_menu(self):
+        # เมนูคลิกขวา: เหลือแค่ เปลี่ยนตัวละคร / ดูสถานะ
         m = tk.Menu(self.root, tearoff=0)
-        m.add_command(label="🍎  ให้อาหาร", command=self.feed)
-        m.add_command(label="✋  ลูบหัว / เล่นด้วย", command=self.pet_react)
-        m.add_command(label="🧍  ยืนเฉย ๆ (หันไปมา)", command=self.toggle_stand)
-        m.add_separator()
         self.char_menu = tk.Menu(m, tearoff=0)     # เมนูย่อย "เปลี่ยนตัวละคร" (เติมรายชื่อตอนเปิด)
         m.add_cascade(label="🎭  เปลี่ยนตัวละคร", menu=self.char_menu)
         m.add_command(label="📊  ดูสถานะ / เลเวล", command=self.show_status)
-        m.add_command(label="🖥  เปิด/ปิด แผงสถานะ (มุมจอ)", command=self.toggle_hud)
-        m.add_command(label="❌  ออกจากโปรแกรม", command=self.quit)
         self.menu = m
+
+        # เมนูตั้งค่า: เปิดจากปุ่ม ⚙ มุมขวาล่างของแถบ
+        sm = tk.Menu(self.root, tearoff=0)
+        sm.add_command(label="🔄  อัพเดทโปรแกรม", command=self.update_program)
+        sm.add_command(label="ℹ  เกี่ยวกับโปรแกรม", command=self.show_about)
+        sm.add_separator()
+        sm.add_command(label="❌  ออกจากระบบ", command=self.quit)
+        self.settings_menu = sm
 
     def _refresh_character_menu(self):
         """เติมรายชื่อตัวละครใหม่ทุกครั้งที่เปิดเมนู (เพิ่มโฟลเดอร์แล้วเห็นทันที ไม่ต้องรีสตาร์ท)"""
@@ -340,10 +345,6 @@ class World:
             self.pet_react()                 # คลิกเฉย ๆ = โต้ตอบ
 
     def on_menu(self, e):
-        # ให้อาหารกดไม่ได้ตอนกำลังสู้ หรือสลบ
-        busy = self.monster is not None or self.pet.behavior == "ko"
-        self.menu.entryconfigure("🍎  ให้อาหาร",
-                                 state="disabled" if busy else "normal")
         self._refresh_character_menu()
         try:
             self.menu.tk_popup(e.x_root, e.y_root)
@@ -757,9 +758,8 @@ class World:
         self.canvas.coords(rect, x0 - pad, y0 - pad, x1 + pad, y1 + pad)
 
     def _on_hud_click(self, e):
-        """กดปุ่มบนแผง = สลับย่อ/ขยาย (เมนูซ้ายย่อ/ขยายตามแผงด้วย)"""
+        """กดปุ่มบนแผง = สลับย่อ/ขยายแผงสถานะ (อิสระจากเมนูให้อาหาร)"""
         self.hud_collapsed = not self.hud_collapsed
-        self.menu_collapsed = self.hud_collapsed
         self._draw_hud()
         return "break"
 
@@ -769,10 +769,18 @@ class World:
         self._draw_hud()
         return "break"
 
-    def _on_menu_icon_click(self, e):
-        """กดไอคอน ☰ = เปิดเฉพาะเมนูซ้าย (ไม่ขยายแผง bar)"""
-        self.menu_collapsed = False
+    def _toggle_feed_menu(self, e):
+        """กดปุ่ม ☰/✕ = เปิด/ปิดเมนูให้อาหาร–ลูบหัว (อิสระจากการย่อแผง)"""
+        self.menu_collapsed = not self.menu_collapsed
         self._draw_hud()
+        return "break"
+
+    def _on_settings_click(self, e):
+        """กดปุ่ม ⚙ = เปิดเมนูตั้งค่า (อัพเดท / เกี่ยวกับ / ออก)"""
+        try:
+            self.settings_menu.tk_popup(e.x_root, e.y_root)
+        finally:
+            self.settings_menu.grab_release()
         return "break"
 
     def _draw_button(self, x0, y0, x1, y1, text, tag, enabled=True):
@@ -784,6 +792,16 @@ class World:
         self.canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=text,
                                  fill="#ffffff" if enabled else "#6a6a6a",
                                  font=("Segoe UI", 12, "bold"), tags=tags)
+
+    def _draw_icon_button(self, x0, y0, x1, y1, icon, tag, enabled=True):
+        """วาดปุ่มแบบไอคอนล้วน (กระชับ ไม่มีข้อความ)"""
+        tags = ("hud", tag) if enabled else ("hud",)
+        self.canvas.create_rectangle(x0, y0, x1, y1,
+                                     fill="#2c3e50" if enabled else "#2a2a2a",
+                                     outline="#5a5a5a", width=2, tags=tags)
+        self.canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=icon,
+                                 fill="#ffffff" if enabled else "#6a6a6a",
+                                 font=("Segoe UI Emoji", 18), tags=tags)
 
     def _draw_hud(self):
         """แผงสถานะแบบติดมุมขวาล่างของ 'จอหลัก' (เห็นชัดเสมอ ไม่ติดตามเพ็ท)"""
@@ -802,13 +820,23 @@ class World:
         bar_w = tab_w if self.hud_collapsed else panel_w   # กว้างเท่าแผง/แท็บที่กำลังโชว์
         panel_top = y1 - (tab_h if self.hud_collapsed else panel_h)
 
-        # ---- ป้ายเวฟ: แยกจากแผง ลอยเหนือแผง กว้างเท่า bar ด้านล่าง (ทั้งตอนย่อ/ขยาย) ----
+        # ---- ปุ่มตั้งค่า ⚙ : มุมขวาล่างสุด อยู่ "นอกกล่อง" ทางขวาของแถบ ----
+        gear = 40
+        self.canvas.create_rectangle(x1 - gear, y1 - gear, x1, y1,
+                                     fill="#2c3e50", outline="#5a5a5a", width=2,
+                                     tags=("hud", "btn_settings"))
+        self.canvas.create_text(x1 - gear / 2, y1 - gear / 2, text="⚙",
+                                fill="#ffffff", font=("Segoe UI Emoji", 18),
+                                tags=("hud", "btn_settings"))
+        px1 = x1 - gear - 10           # ขอบขวาของแถบ/แผง = ซ้ายของปุ่มตั้งค่า
+
+        # ---- ป้ายเวฟ: ลอยเหนือแผง กว้างเท่า bar ด้านล่าง (ทั้งตอนย่อ/ขยาย) ----
         if self.monster is not None and self.monster.is_boss:
             wave_text = f"⚔ เวฟ {self.wave_round}  ·  👑 บอส"
         else:
             wave_text = f"⚔ เวฟ {self.wave_round}  ·  {self.wave_step}/{config.WAVE_LENGTH}"
         wbar_h, wgap = 30, 8
-        wbx0, wbx1 = x1 - bar_w, x1
+        wbx0, wbx1 = px1 - bar_w, px1
         wby1 = panel_top - wgap
         wby0 = wby1 - wbar_h
         self.canvas.create_rectangle(wbx0, wby0, wbx1, wby1, fill="#1e1e1e",
@@ -816,37 +844,36 @@ class World:
         self.canvas.create_text((wbx0 + wbx1) / 2, (wby0 + wby1) / 2, text=wave_text,
                                 fill="#f1c40f", font=("Segoe UI", 12, "bold"), tags="hud")
 
-        # ---- เมนูซ้าย: อยู่นอกกล่อง bar ด้านซ้าย (มี state แยกจากแผง) ----
+        # ---- เมนูให้อาหาร/ลูบหัว: ไอคอนล้วน กระชับ + ปุ่ม ☰/✕ เปิด-ปิด (นอกกล่องซ้าย) ----
         menu_gap = 12
-        mx1 = (x1 - bar_w) - menu_gap          # ขอบขวาของเมนู = ซ้ายของ bar เว้นระยะ
-        if self.menu_collapsed:
-            # ย่อ: เหลือไอคอน ☰ กดเพื่อเปิดเฉพาะเมนู (แผงไม่ขยาย)
-            self._draw_button(mx1 - 46, y1 - 44, mx1, y1, "☰", "btn_menu")
-        else:
-            mbw, mbh, mvgap = 140, 44, 8
-            mbx0 = mx1 - mbw
+        mx1 = (px1 - bar_w) - menu_gap          # ขอบขวาของเมนู = ซ้ายของ bar เว้นระยะ
+        ib, vgap = 40, 6                         # ปุ่มไอคอน 40x40 ช่องไฟ 6 (กระชับ)
+        # ปุ่มสลับเปิด/ปิดเมนู — อยู่ล่างสุดเสมอ ฐานเดียวกับแถบ
+        self._draw_icon_button(mx1 - ib, y1 - ib, mx1, y1,
+                               "☰" if self.menu_collapsed else "✕", "btn_menu")
+        if not self.menu_collapsed:
             feed_on = self.monster is None and self.pet.behavior != "ko"
             pat_on = self.pet.behavior != "ko"
-            # ลูบหัว (ล่าง ชิดฐานเดียวกับ bar) / ให้อาหาร (บน)
-            self._draw_button(mbx0, y1 - mbh, mx1, y1, "✋  ลูบหัว", "btn_pat", pat_on)
-            fy1 = y1 - mbh - mvgap
-            self._draw_button(mbx0, fy1 - mbh, mx1, fy1, "🍎  ให้อาหาร", "btn_feed", feed_on)
+            py1 = y1 - ib - vgap                # เหนือปุ่มสลับ: ✋ ลูบหัว
+            self._draw_icon_button(mx1 - ib, py1 - ib, mx1, py1, "✋", "btn_pat", pat_on)
+            fy1 = py1 - ib - vgap               # บนสุด: 🍎 ให้อาหาร
+            self._draw_icon_button(mx1 - ib, fy1 - ib, mx1, fy1, "🍎", "btn_feed", feed_on)
 
         # ---- สถานะย่อ: เหลือแค่แท็บเล็ก ๆ กดเพื่อขยาย ----
         if self.hud_collapsed:
-            x0, y0 = x1 - tab_w, panel_top
-            self.canvas.create_rectangle(x0, y0, x1, y1, fill="#1e1e1e",
+            x0, y0 = px1 - tab_w, panel_top
+            self.canvas.create_rectangle(x0, y0, px1, y1, fill="#1e1e1e",
                                          outline="#5a5a5a", width=3,
                                          tags=("hud", "hud_toggle"))
-            self.canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2,
+            self.canvas.create_text((x0 + px1) / 2, (y0 + y1) / 2,
                                     text=f"🐾 Lv.{p.level}   ▸",
                                     fill="#ffffff", font=("Segoe UI", 12, "bold"),
                                     tags=("hud", "hud_toggle"))
             return
 
         # ---- สถานะขยายเต็ม ----
-        x0, y0 = x1 - panel_w, panel_top
-        self.canvas.create_rectangle(x0, y0, x1, y1, fill="#1e1e1e",
+        x0, y0 = px1 - panel_w, panel_top
+        self.canvas.create_rectangle(x0, y0, px1, y1, fill="#1e1e1e",
                                      outline="#5a5a5a", width=3, tags="hud")
         # ปุ่ม 🐾 (กดเพื่อเปลี่ยนตัวละคร) + ชื่อตัวละคร + เลเวล
         ib = 32
@@ -862,7 +889,7 @@ class World:
                                 fill="#ffffff", font=("Segoe UI", 14, "bold"), tags="hud")
         # ปุ่มย่อ (มุมขวาบนของแผง)
         btn = 24
-        bx1, by0 = x1 - 12, y0 + 12
+        bx1, by0 = px1 - 12, y0 + 12
         bx0, by1 = bx1 - btn, by0 + btn
         self.canvas.create_rectangle(bx0, by0, bx1, by1, fill="#3a3a3a",
                                      outline="#777777", tags=("hud", "hud_toggle"))
@@ -1036,6 +1063,47 @@ class World:
         if self.food is not None:
             ents.append(self.food)
         return ents
+
+    def show_about(self):
+        """กล่องข้อมูล 'เกี่ยวกับโปรแกรม'"""
+        self.root.wm_attributes("-topmost", False)
+        try:
+            messagebox.showinfo(
+                "เกี่ยวกับโปรแกรม",
+                "LOVE_PET  🐾\n"
+                "เดสก์ท็อปเพ็ตน่ารัก ๆ บนหน้าจอ\n\n"
+                "การใช้งาน\n"
+                "  • คลิกซ้าย : ลูบหัว / เล่นด้วย\n"
+                "  • ลาก         : ย้ายตำแหน่ง\n"
+                "  • คลิกขวา  : เปลี่ยนตัวละคร / ดูสถานะ\n"
+                "  • ปุ่ม ⚙       : ตั้งค่า (อัพเดท / ออก)\n\n"
+                "อัพเดทโค้ดล่าสุดได้ที่  ⚙ → อัพเดทโปรแกรม",
+            )
+        finally:
+            self.root.wm_attributes("-topmost", True)
+
+    def update_program(self):
+        """ดึงโค้ดล่าสุดจาก GitHub แล้วเปิดโปรแกรมใหม่ (เก็บเซฟเกมไว้)"""
+        bat = os.path.join(os.path.dirname(os.path.abspath(__file__)), "update.bat")
+        if not os.path.exists(bat):
+            messagebox.showinfo("อัพเดท", "ไม่พบไฟล์ update.bat ในโฟลเดอร์โปรแกรม")
+            return
+        if not messagebox.askyesno(
+                "อัพเดทโปรแกรม",
+                "จะดึงโค้ดล่าสุดจาก GitHub แล้วเปิดโปรแกรมใหม่\n"
+                "(เซฟเกมจะถูกเก็บไว้ให้)\n\nดำเนินการต่อหรือไม่?"):
+            return
+        self._save_progress()
+        try:
+            # เปิด update.bat ในหน้าต่างใหม่ที่แยกจากตัวโปรแกรม แล้วปิดตัวเอง
+            subprocess.Popen(
+                ["cmd", "/c", "start", "", bat],
+                cwd=os.path.dirname(bat),
+            )
+        except Exception as e:
+            messagebox.showerror("อัพเดท", f"เปิดตัวอัพเดทไม่ได้: {e}")
+            return
+        self.root.destroy()
 
     def quit(self):
         self._save_progress()

@@ -1,0 +1,11 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Runtime / local data (must NOT be overwritten by updates)
+save.json
+error.log
+*.bak
+
+# Windows shortcuts
+*.lnk
