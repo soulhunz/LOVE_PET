@@ -45,6 +45,97 @@ class Animation:
 # ---------------------------------------------------------------------------
 # โหลดจากไฟล์ของผู้ใช้
 # ---------------------------------------------------------------------------
+def _pixel(img, x, y):
+    """อ่านสี (r,g,b) ของพิกเซล รองรับทั้งแบบคืน tuple และ string"""
+    v = img.get(x, y)
+    if isinstance(v, (tuple, list)):
+        return int(v[0]), int(v[1]), int(v[2])
+    parts = str(v).split()
+    return int(parts[0]), int(parts[1]), int(parts[2])
+
+
+def _keyout_bg(img):
+    """ทำพื้นหลังของ sprite ให้โปร่งใส (แทนด้วย TRANSPARENT_KEY = magenta)
+    - ภาพมี alpha (PNG โปร่งใส): เปลี่ยน 'พิกเซลโปร่งใส' เป็นสีคีย์โดยตรง
+      (กันบางเครื่องที่ไม่เรนเดอร์ alpha และตัดขอบรุ่งริ่ง)
+    - ภาพพื้นทึบสีเดียว: เดาสีพื้นจากมุม แล้ว flood fill จากขอบ (ไม่กินสีกลางตัว)
+    ปิดได้ด้วย config.AUTO_REMOVE_BG = False"""
+    if not getattr(config, "AUTO_REMOVE_BG", True):
+        return img
+    w, h = img.width(), img.height()
+    if w < 2 or h < 2:
+        return img
+    # มี alpha ไหม (เช็คจากมุม) -> เลือกโหมด
+    try:
+        has_alpha = bool(img.transparency_get(0, 0))
+    except Exception:
+        has_alpha = False
+    if has_alpha:
+        return _flatten_alpha(img)
+    return _flood_keyout(img, getattr(config, "BG_TOLERANCE", 40))
+
+
+def _flatten_alpha(img):
+    """แบน PNG ที่มี alpha: พิกเซลโปร่งใส -> สีคีย์, พิกเซลทึบ -> คงสีเดิม"""
+    w, h = img.width(), img.height()
+    key = config.TRANSPARENT_KEY
+    tget, pixel = img.transparency_get, _pixel
+    rows = []
+    for y in range(h):
+        row = []
+        for x in range(w):
+            if tget(x, y):
+                row.append(key)
+            else:
+                r, g, b = pixel(img, x, y)
+                row.append(f"#{r:02x}{g:02x}{b:02x}")
+        rows.append("{" + " ".join(row) + "}")
+    out = tk.PhotoImage(width=w, height=h)
+    out.put(" ".join(rows))
+    return out
+
+
+def _flood_keyout(img, tol):
+    """ภาพพื้นทึบ: เดาสีพื้นจากมุมซ้ายบน ลบเฉพาะบริเวณที่ต่อเนื่องจากขอบภาพ (flood fill)"""
+    w, h = img.width(), img.height()
+    px = [[_pixel(img, x, y) for x in range(w)] for y in range(h)]
+    br, bg_, bb = px[0][0]
+
+    def is_bg(c):
+        return abs(c[0] - br) + abs(c[1] - bg_) + abs(c[2] - bb) <= tol
+
+    clear = [[False] * w for _ in range(h)]
+    stack = []
+    for x in range(w):
+        for y in (0, h - 1):
+            if is_bg(px[y][x]):
+                clear[y][x] = True; stack.append((x, y))
+    for y in range(h):
+        for x in (0, w - 1):
+            if is_bg(px[y][x]):
+                clear[y][x] = True; stack.append((x, y))
+    while stack:
+        x, y = stack.pop()
+        for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+            if 0 <= nx < w and 0 <= ny < h and not clear[ny][nx] and is_bg(px[ny][nx]):
+                clear[ny][nx] = True; stack.append((nx, ny))
+
+    key = config.TRANSPARENT_KEY
+    rows = []
+    for y in range(h):
+        row = []
+        for x in range(w):
+            if clear[y][x]:
+                row.append(key)
+            else:
+                r, g, b = px[y][x]
+                row.append(f"#{r:02x}{g:02x}{b:02x}")
+        rows.append("{" + " ".join(row) + "}")
+    out = tk.PhotoImage(width=w, height=h)
+    out.put(" ".join(rows))
+    return out
+
+
 def _load_gif_frames(path):
     """โหลดทุกเฟรมจากไฟล์ GIF (รองรับ GIF เคลื่อนไหว)"""
     frames = []
@@ -145,10 +236,11 @@ def load_sprite(candidates):
             continue
         try:
             if path.lower().endswith(".gif"):
-                frames = _load_gif_frames(path)
+                frames = [_keyout_bg(f) for f in _load_gif_frames(path)]
             else:
-                frames = _slice_sheet(tk.PhotoImage(file=path),
-                                      _frame_count_from_name(path))
+                # ลบพื้นหลังที่ 'แผ่นรวม' ก่อน แล้วค่อยตัดเป็นเฟรม (ทำครั้งเดียว เร็วกว่า)
+                sheet = _keyout_bg(tk.PhotoImage(file=path))
+                frames = _slice_sheet(sheet, _frame_count_from_name(path))
         except tk.TclError:
             continue
         if frames:
