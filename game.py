@@ -165,7 +165,7 @@ class World:
                              lambda e: self._menu_click(self.pet_react))
         self.canvas.tag_bind("btn_menu", "<Button-1>", self._toggle_feed_menu)
         self.canvas.tag_bind("btn_char", "<Button-1>",
-                             lambda e: self._menu_click(self._cycle_character))
+                             lambda e: self._show_character_popup())
         self.canvas.tag_bind("btn_settings", "<Button-1>", self._on_settings_click)
         self.root.bind("<B1-Motion>", self.on_drag)
         self.root.bind("<ButtonRelease-1>", self.on_release)
@@ -284,32 +284,67 @@ class World:
         ent.y = self._ground_y(ent.x) - ent.current_anim().h / 2
 
     def _build_menu(self):
-        # เมนูคลิกขวา: เหลือแค่ เปลี่ยนตัวละคร / ดูสถานะ
+        # เมนูคลิกขวา: เปลี่ยนตัวละคร (เปิดหน้าต่างเลือก) / ดูสถานะ
         m = tk.Menu(self.root, tearoff=0)
-        self.char_menu = tk.Menu(m, tearoff=0)     # เมนูย่อย "เปลี่ยนตัวละคร" (เติมรายชื่อตอนเปิด)
-        m.add_cascade(label="🎭  เปลี่ยนตัวละคร", menu=self.char_menu)
+        m.add_command(label="🎭  เปลี่ยนตัวละคร", command=self._show_character_popup)
         m.add_command(label="📊  ดูสถานะ / เลเวล", command=self.show_status)
         self.menu = m
 
-        # ปุ่ม ⚙ ตั้งค่าใช้ป๊อปอัปแบบกำหนดเอง (สวยกว่า + เด้งเหนือปุ่ม) ดู _show_settings_popup
+        # ป๊อปอัปแบบกำหนดเอง (ธีมเข้ม) — สร้างใหม่ทุกครั้งที่เปิด
         self._settings_win = None
+        self._char_win = None
 
-    def _refresh_character_menu(self):
-        """เติมรายชื่อตัวละครใหม่ทุกครั้งที่เปิดเมนู (เพิ่มโฟลเดอร์แล้วเห็นทันที ไม่ต้องรีสตาร์ท)"""
-        cm = self.char_menu
-        cm.delete(0, "end")
-        check = "✓ "
-        cm.add_command(label=f"{check if self.character is None else '   '}ค่าเริ่มต้น (assets)",
-                       command=lambda: self.set_character(None))
-        chars = assets.list_characters()
-        if not chars:
-            cm.add_separator()
-            cm.add_command(label="(ยังไม่มีโฟลเดอร์ใน characters/)", state="disabled")
+    def _show_character_popup(self):
+        """หน้าต่างเลือกตัวละคร (ธีมเข้ม มี hover + ✓ ตัวที่ใช้อยู่) อยู่กลางจอหลัก"""
+        self._close_settings_popup()
+        if getattr(self, "_char_win", None) is not None:
+            self._close_char_popup()
             return
-        for name in chars:
-            mark = check if name == self.character else "   "
-            cm.add_command(label=f"{mark}{name}",
-                           command=lambda n=name: self.set_character(n))
+        options = [(None, "ค่าเริ่มต้น (assets)")]
+        options += [(n, n) for n in assets.list_characters()]
+        BG, FG, HOVER, SEL = "#1e1e1e", "#ffffff", "#34506b", "#1f6f4a"
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.wm_attributes("-topmost", True)
+        win.configure(bg="#5a5a5a")                       # ขอบ 2px
+        frame = tk.Frame(win, bg=BG)
+        frame.pack(padx=2, pady=2)
+        tk.Label(frame, text="🎭  เลือกตัวละคร", bg="#15151a", fg="#f1c40f",
+                 font=("Segoe UI", 13, "bold"), pady=11).pack(fill="x")
+        for value, label in options:
+            cur = (value == self.character)
+            base = SEL if cur else BG
+            mark = "✓" if cur else "  "
+            row = tk.Label(frame, text=f"   {mark}   🐾   {label}", anchor="w",
+                           bg=base, fg=FG, font=("Segoe UI", 12),
+                           padx=20, pady=10, cursor="hand2")
+            row.pack(fill="x")
+            row.bind("<Enter>", lambda e, r=row: r.configure(bg=HOVER))
+            row.bind("<Leave>", lambda e, r=row, b=base: r.configure(bg=b))
+            row.bind("<Button-1>", lambda e, v=value: self._char_choose(v))
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        x = int(self.primary_w / 2 - w / 2)
+        y = int(self.primary_h / 2 - h / 2)
+        win.geometry(f"{w}x{h}+{x}+{y}")
+        self._char_win = win
+        win.bind("<FocusOut>", lambda e: self._close_char_popup())
+        win.bind("<Escape>", lambda e: self._close_char_popup())
+        win.focus_force()
+
+    def _close_char_popup(self):
+        w = getattr(self, "_char_win", None)
+        self._char_win = None
+        if w is not None:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+    def _char_choose(self, value):
+        self._close_char_popup()
+        self.set_character(value)
+        self._draw_hud()
 
     # ----------------------------------------------------------------- inputs
     def on_press(self, e):
@@ -340,7 +375,6 @@ class World:
             self.pet_react()                 # คลิกเฉย ๆ = โต้ตอบ
 
     def on_menu(self, e):
-        self._refresh_character_menu()
         try:
             self.menu.tk_popup(e.x_root, e.y_root)
         finally:
@@ -796,6 +830,7 @@ class World:
         items = [
             ("🔄", "อัพเดทโปรแกรม", self.update_program, "#2c3e50"),
             ("ℹ", "เกี่ยวกับโปรแกรม", self.show_about, "#2c3e50"),
+            ("sep", None, None, None),
             ("❌", "ออกจากระบบ", self.quit, "#c0392b"),
         ]
         BG, FG = "#1e1e1e", "#ffffff"
@@ -806,6 +841,9 @@ class World:
         frame = tk.Frame(win, bg=BG)
         frame.pack(padx=2, pady=2)
         for icon, text, cmd, hover in items:
+            if icon == "sep":                       # เส้นแบ่งกลุ่มเมนู
+                tk.Frame(frame, bg="#3a3a3a", height=1).pack(fill="x", padx=8, pady=4)
+                continue
             row = tk.Label(frame, text=f"   {icon}    {text}", anchor="w",
                            bg=BG, fg=FG, font=("Segoe UI", 12),
                            padx=18, pady=9, cursor="hand2")
