@@ -291,13 +291,8 @@ class World:
         m.add_command(label="📊  ดูสถานะ / เลเวล", command=self.show_status)
         self.menu = m
 
-        # เมนูตั้งค่า: เปิดจากปุ่ม ⚙ มุมขวาล่างของแถบ
-        sm = tk.Menu(self.root, tearoff=0)
-        sm.add_command(label="🔄  อัพเดทโปรแกรม", command=self.update_program)
-        sm.add_command(label="ℹ  เกี่ยวกับโปรแกรม", command=self.show_about)
-        sm.add_separator()
-        sm.add_command(label="❌  ออกจากระบบ", command=self.quit)
-        self.settings_menu = sm
+        # ปุ่ม ⚙ ตั้งค่าใช้ป๊อปอัปแบบกำหนดเอง (สวยกว่า + เด้งเหนือปุ่ม) ดู _show_settings_popup
+        self._settings_win = None
 
     def _refresh_character_menu(self):
         """เติมรายชื่อตัวละครใหม่ทุกครั้งที่เปิดเมนู (เพิ่มโฟลเดอร์แล้วเห็นทันที ไม่ต้องรีสตาร์ท)"""
@@ -776,12 +771,60 @@ class World:
         return "break"
 
     def _on_settings_click(self, e):
-        """กดปุ่ม ⚙ = เปิดเมนูตั้งค่า (อัพเดท / เกี่ยวกับ / ออก)"""
-        try:
-            self.settings_menu.tk_popup(e.x_root, e.y_root)
-        finally:
-            self.settings_menu.grab_release()
+        """กดปุ่ม ⚙ = เปิด/ปิดป๊อปอัปตั้งค่า (เด้งเหนือปุ่ม)"""
+        if getattr(self, "_settings_win", None) is not None:
+            self._close_settings_popup()
+        else:
+            self._show_settings_popup()
         return "break"
+
+    def _close_settings_popup(self):
+        w = getattr(self, "_settings_win", None)
+        self._settings_win = None
+        if w is not None:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+    def _settings_choose(self, cmd):
+        self._close_settings_popup()
+        cmd()
+
+    def _show_settings_popup(self):
+        """ป๊อปอัปตั้งค่าแบบกำหนดเอง: ธีมเข้ม มี hover เด้งเหนือปุ่ม ⚙"""
+        items = [
+            ("🔄", "อัพเดทโปรแกรม", self.update_program, "#2c3e50"),
+            ("ℹ", "เกี่ยวกับโปรแกรม", self.show_about, "#2c3e50"),
+            ("❌", "ออกจากระบบ", self.quit, "#c0392b"),
+        ]
+        BG, FG = "#1e1e1e", "#ffffff"
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.wm_attributes("-topmost", True)
+        win.configure(bg="#5a5a5a")                 # ขอบ 2px
+        frame = tk.Frame(win, bg=BG)
+        frame.pack(padx=2, pady=2)
+        for icon, text, cmd, hover in items:
+            row = tk.Label(frame, text=f"   {icon}    {text}", anchor="w",
+                           bg=BG, fg=FG, font=("Segoe UI", 12),
+                           padx=18, pady=9, cursor="hand2")
+            row.pack(fill="x")
+            row.bind("<Enter>", lambda e, r=row, c=hover: r.configure(bg=c))
+            row.bind("<Leave>", lambda e, r=row: r.configure(bg=BG))
+            row.bind("<Button-1>", lambda e, c=cmd: self._settings_choose(c))
+        # วางเหนือปุ่ม ⚙ (ชิดขวาตรงกับปุ่ม)
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        gx0, gy0, gx1, gy1 = getattr(self, "_gear_canvas", (0, 0, 0, 0))
+        rootx, rooty = self.canvas.winfo_rootx(), self.canvas.winfo_rooty()
+        x = rootx + gx1 - w                          # ขอบขวาเมนู = ขอบขวาปุ่ม
+        y = rooty + gy0 - 6 - h                       # เหนือปุ่ม เว้น 6px
+        win.geometry(f"{w}x{h}+{int(x)}+{int(y)}")
+        self._settings_win = win
+        win.bind("<FocusOut>", lambda e: self._close_settings_popup())
+        win.bind("<Escape>", lambda e: self._close_settings_popup())
+        win.focus_force()
 
     def _draw_button(self, x0, y0, x1, y1, text, tag, enabled=True):
         """วาดปุ่มกดบน canvas (ถ้า enabled=False จะเป็นสีจางและกดไม่ได้)"""
@@ -816,7 +859,7 @@ class World:
 
         x1, y1 = right - margin, bottom - margin
         panel_w, panel_h = 300, 168
-        tab_w, tab_h = 138, 36
+        tab_w, tab_h = panel_w, 36         # ตอนย่อ: กว้างเท่าตอนขยาย (สวยกว่า)
         bar_w = tab_w if self.hud_collapsed else panel_w   # กว้างเท่าแผง/แท็บที่กำลังโชว์
         panel_top = y1 - (tab_h if self.hud_collapsed else panel_h)
 
@@ -829,6 +872,7 @@ class World:
                                 fill="#ffffff", font=("Segoe UI Emoji", 18),
                                 tags=("hud", "btn_settings"))
         px1 = x1 - gear - 10           # ขอบขวาของแถบ/แผง = ซ้ายของปุ่มตั้งค่า
+        self._gear_canvas = (x1 - gear, y1 - gear, x1, y1)  # เก็บไว้วางเมนูตั้งค่าเหนือปุ่ม
 
         # ---- ป้ายเวฟ: ลอยเหนือแผง กว้างเท่า bar ด้านล่าง (ทั้งตอนย่อ/ขยาย) ----
         if self.monster is not None and self.monster.is_boss:
@@ -865,9 +909,14 @@ class World:
             self.canvas.create_rectangle(x0, y0, px1, y1, fill="#1e1e1e",
                                          outline="#5a5a5a", width=3,
                                          tags=("hud", "hud_toggle"))
-            self.canvas.create_text((x0 + px1) / 2, (y0 + y1) / 2,
-                                    text=f"🐾 Lv.{p.level}   ▸",
+            char_name = self.character or "เพ็ท"
+            self.canvas.create_text(x0 + 16, (y0 + y1) / 2, anchor="w",
+                                    text=f"🐾 {char_name}   Lv.{p.level}",
                                     fill="#ffffff", font=("Segoe UI", 12, "bold"),
+                                    tags=("hud", "hud_toggle"))
+            self.canvas.create_text(px1 - 16, (y0 + y1) / 2, anchor="e",
+                                    text="▸ ขยาย", fill="#9aa0a6",
+                                    font=("Segoe UI", 11),
                                     tags=("hud", "hud_toggle"))
             return
 
