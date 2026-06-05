@@ -3,15 +3,19 @@
 import base64
 import ctypes
 from ctypes import wintypes
+import datetime
 import os
 import random
 import subprocess
+import sys
 import tkinter as tk
 from tkinter import messagebox
 
 import config
 import assets
+import paths
 import save
+import sound
 from entities import Pet, Monster, Food
 
 
@@ -137,7 +141,9 @@ class World:
         self.effects = []          # [{"item":id, "ttl":int, "dy":float}]
         self.bubble_items = []
         self.bubble_ttl = 0
-        self.show_hud = True            # แสดงเมนูด้านขวาล่าง
+        self.show_hud = True            # แสดงเมนูด้านขวาล่าง (เปิด/ปิดได้ที่ปุ่ม ☰)
+        self.hud_slide = 0.0            # ความคืบหน้าอนิเมชันยุบ/กาง 0=ยุบ 1=กางเต็ม
+        self._hud_drag_active = False   # กำลังลากเมนูอยู่ไหม
         self.show_status_panel = False  # 📊 กดเพื่อโชว์แผงสถานะ (เริ่มต้น: ซ่อน)
         self.show_actions = False       # 🍎 กดเพื่อโชว์เมนูให้อาหาร/ลูบหัว
         # self.combat_enabled ถูกตั้งใน _load_progress() (เรียกไปแล้วด้านบน)
@@ -149,8 +155,9 @@ class World:
         self._press_xy = (0, 0)
         self.canvas.tag_bind(self.pet.item, "<ButtonPress-1>", self.on_press)
         # ปุ่มเมนูด้านขวา (วาดใหม่ทุกเฟรม จึงผูกกับ tag)
-        hud_btns = ("btn_status", "btn_actions", "btn_combat",
-                    "btn_feed", "btn_pat", "btn_char", "btn_settings")
+        hud_btns = ("btn_status", "btn_actions", "btn_combat", "btn_feed", "btn_pat",
+                    "btn_char", "btn_settings", "btn_hud_edge",
+                    "btn_checkin", "btn_shop", "btn_quest")
         for _tag in hud_btns:
             self.canvas.tag_bind(_tag, "<Enter>",
                                  lambda e: self.canvas.config(cursor="hand2"))
@@ -166,6 +173,13 @@ class World:
         self.canvas.tag_bind("btn_char", "<Button-1>",
                              lambda e: self._show_character_popup())
         self.canvas.tag_bind("btn_settings", "<Button-1>", self._on_settings_click)
+        self.canvas.tag_bind("btn_hud_edge", "<ButtonPress-1>", self._hud_edge_press)
+        self.canvas.tag_bind("btn_checkin", "<Button-1>",
+                             lambda e: self._menu_click(self._show_checkin_window))
+        self.canvas.tag_bind("btn_shop", "<Button-1>",
+                             lambda e: self._menu_click(self._show_shop_window))
+        self.canvas.tag_bind("btn_quest", "<Button-1>",
+                             lambda e: self._menu_click(self._show_quest_window))
         self.root.bind("<B1-Motion>", self.on_drag)
         self.root.bind("<ButtonRelease-1>", self.on_release)
         self.root.bind("<Button-3>", self.on_menu)
@@ -295,10 +309,10 @@ class World:
 
     def _show_character_popup(self):
         """หน้าต่างเลือกตัวละคร (ธีมเข้ม มี hover + ✓ ตัวที่ใช้อยู่) อยู่กลางจอหลัก"""
-        self._close_settings_popup()
         if getattr(self, "_char_win", None) is not None:
             self._close_char_popup()
             return
+        self._close_all_menus()
         options = [(None, "ค่าเริ่มต้น (assets)")]
         options += [(n, n) for n in assets.list_characters()]
         BG, FG, HOVER, SEL = "#1e1e1e", "#ffffff", "#34506b", "#1f6f4a"
@@ -352,6 +366,9 @@ class World:
         self._press_xy = (e.x, e.y)
 
     def on_drag(self, e):
+        if self._hud_drag_active:            # กำลังลากเมนู
+            self._hud_do_drag(e)
+            return
         if not self._down:
             return
         if abs(e.x - self._press_xy[0]) + abs(e.y - self._press_xy[1]) > 6:
@@ -363,6 +380,9 @@ class World:
             self.pet.sync_position()
 
     def on_release(self, e):
+        if self._hud_drag_active:            # ปล่อยจากการลาก/กดเมนู
+            self._hud_end_drag(e)
+            return
         if not self._down:
             return
         self._down = False
@@ -372,6 +392,33 @@ class World:
             self.pet.vx = 0
         else:
             self.pet_react()                 # คลิกเฉย ๆ = โต้ตอบ
+
+    # ----------------------------------------------------- ลากเมนูไปวางที่อื่น
+    def _hud_edge_press(self, e):
+        """กดที่ปุ่ม ☰ — เริ่มจับการลาก (ถ้าขยับ = ย้ายเมนู, ถ้าไม่ขยับ = เปิด/ปิด)"""
+        self._hud_drag_active = True
+        self._hud_moved = False
+        self._hud_press_root = (e.x_root, e.y_root)
+        self._hud_press_offset = (self.hud_offset_x, self.hud_offset_y)
+        return "break"
+
+    def _hud_do_drag(self, e):
+        dx = e.x_root - self._hud_press_root[0]
+        dy = e.y_root - self._hud_press_root[1]
+        if abs(dx) + abs(dy) > 5:
+            self._hud_moved = True
+        self.hud_offset_x = self._hud_press_offset[0] + dx
+        self.hud_offset_y = self._hud_press_offset[1] + dy
+        self._draw_hud()                     # _draw_hud จะ clamp ให้อยู่ในจอเอง
+
+    def _hud_end_drag(self, e):
+        self._hud_drag_active = False
+        if self._hud_moved:
+            self._save_progress()            # จำตำแหน่งใหม่
+        else:
+            self.show_hud = not self.show_hud   # กดเฉย ๆ = เปิด/ปิดเมนู
+            sound.play("click")
+        self._draw_hud()
 
     def on_menu(self, e):
         try:
@@ -385,6 +432,7 @@ class World:
             return
         self.pet.happy = min(100, self.pet.happy + 8)
         self.show_bubble(random.choice(["❤", "♪", "สบายดี!", "ฮุ่ย~"]))
+        sound.play("pet")
         self.add_xp(config.XP_PER_PET)
 
     def feed(self):
@@ -467,6 +515,7 @@ class World:
         self.pet.behavior = "fight"
         if is_boss:
             self.show_bubble(f"👑 บอสเวฟ {self.wave_round} มาแล้ว!")
+            sound.play("boss")
         else:
             self.show_bubble(f"⚔ มอนสเตอร์ ({self.wave_step}/{config.WAVE_LENGTH})")
 
@@ -486,9 +535,23 @@ class World:
             self.show_bubble("ยืนเฉย ๆ 🧍")
 
     def toggle_hud(self):
+        self.show_hud = not self.show_hud   # อนิเมชันสไลด์จัดการซ่อน/แสดงใน _draw_hud
+
+    def _on_hud_edge_click(self, e):
+        """กดปุ่ม handle ขอบขวา = เปิด/ปิดเมนูขวา (สไลด์เข้า/ออก)"""
         self.show_hud = not self.show_hud
-        if not self.show_hud:
-            self.canvas.delete("hud")
+        self._draw_hud()
+        return "break"
+
+    def _draw_edge_handle(self, rect):
+        """ปุ่มเมนู ☰ (ช่องล่างสุด) — กดเพื่อยุบ/ขยายปุ่มอื่นเข้า/ออกจากปุ่มนี้ (เห็นตลอด)"""
+        hx0, hy0, hx1, hy1 = rect
+        self.canvas.create_rectangle(hx0, hy0, hx1, hy1, fill="#2c3e50",
+                                     outline="#5a5a5a", width=2,
+                                     tags=("hudedge", "btn_hud_edge"))
+        self.canvas.create_text((hx0 + hx1) / 2, (hy0 + hy1) / 2, text="☰",
+                                fill="#ffffff", font=("Segoe UI", 14, "bold"),
+                                tags=("hudedge", "btn_hud_edge"))
 
     def add_xp(self, amount):
         """เพิ่ม XP และเลื่อนเลเวลถ้าครบ (เลเวลอัปจะฟื้นเลือดเต็ม)"""
@@ -503,10 +566,74 @@ class World:
             p.hp = p.max_hp()
             self.show_bubble(f"⬆ LEVEL UP! Lv.{p.level}")
             self.spawn_effect(p.x, p.top_y(), "✨")
+            sound.play("levelup")
             new_form = self._pet_form_for_level(p.level)
             if new_form != self.cur_form:
                 self._apply_pet_form(new_form, announce=True)
         self._save_progress()
+
+    # -------------------------------------------------- เหรียญ / รางวัลรายวัน
+    def add_coins(self, amount):
+        self.coins = max(0, self.coins + int(amount))
+
+    @staticmethod
+    def _today():
+        return datetime.date.today().isoformat()
+
+    # ------------------------------------------------------ เช็คอินรายวัน
+    def _can_checkin(self):
+        return self.last_login != self._today()
+
+    def _checkin_reward(self, streak):
+        return min(config.DAILY_REWARD_MAX,
+                   config.DAILY_REWARD_BASE + (streak - 1) * config.DAILY_REWARD_PER_DAY)
+
+    def _claim_checkin(self):
+        """รับรางวัลเช็คอินของวันนี้ (คืน reward ที่ได้ หรือ 0 ถ้ารับไปแล้ว)"""
+        if not self._can_checkin():
+            return 0
+        today = datetime.date.today()
+        yesterday = (today - datetime.timedelta(days=1)).isoformat()
+        self.login_streak = self.login_streak + 1 if self.last_login == yesterday else 1
+        self.last_login = today.isoformat()
+        reward = self._checkin_reward(self.login_streak)
+        self.add_coins(reward)
+        self._save_progress()
+        sound.play("levelup")
+        self.spawn_effect(self.pet.x, self.pet.top_y(), "🎁")
+        return reward
+
+    # ---------------------------------------------------- เควสรายวัน
+    def _reset_quests_if_new_day(self):
+        if self.quest_date != self._today():
+            self.quest_date = self._today()
+            self.quest_progress = {q["id"]: 0 for q in config.DAILY_QUESTS}
+            self.quest_claimed = []
+
+    def _quest_advance(self, qid, n=1):
+        """เพิ่มความคืบหน้าเควส (เรียกตอนให้อาหาร/ล้มมอน/ล้มบอส)"""
+        self._reset_quests_if_new_day()
+        if qid in self.quest_progress:
+            self.quest_progress[qid] += n
+
+    def _quest_done(self, q):
+        return self.quest_progress.get(q["id"], 0) >= q["goal"]
+
+    def _quest_claimable(self, q):
+        return self._quest_done(q) and q["id"] not in self.quest_claimed
+
+    def _any_quest_claimable(self):
+        self._reset_quests_if_new_day()
+        return any(self._quest_claimable(q) for q in config.DAILY_QUESTS)
+
+    def _claim_quest(self, q):
+        if self._quest_claimable(q):
+            self.quest_claimed.append(q["id"])
+            self.add_coins(q["reward"])
+            self._save_progress()
+            sound.play("levelup")
+            return True
+        return False
 
     def show_status(self):
         p = self.pet
@@ -538,6 +665,21 @@ class World:
         self.wave_round = max(1, int(data.get("wave_round", 1)))
         self.wave_step = min(config.WAVE_LENGTH, max(1, int(data.get("wave_step", 1))))
         self.combat_enabled = bool(data.get("combat_enabled", True))
+        self.sound_on = bool(data.get("sound_on", True))
+        sound.set_enabled(self.sound_on)
+        # เศรษฐกิจ/รายวัน
+        self.coins = max(0, int(data.get("coins", 0)))
+        self.last_login = str(data.get("last_login", ""))
+        self.login_streak = max(0, int(data.get("login_streak", 0)))
+        # เควสรายวัน
+        self.quest_date = str(data.get("quest_date", ""))
+        prog = data.get("quest_progress", {})
+        self.quest_progress = {q["id"]: int(prog.get(q["id"], 0)) for q in config.DAILY_QUESTS}
+        self.quest_claimed = list(data.get("quest_claimed", []))
+        self._reset_quests_if_new_day()
+        # ตำแหน่งเมนู (ลากย้ายได้)
+        self.hud_offset_x = float(data.get("hud_offset_x", 0))
+        self.hud_offset_y = float(data.get("hud_offset_y", 0))
 
     def _save_progress(self):
         p = self.pet
@@ -550,7 +692,16 @@ class World:
             "wave_round": self.wave_round,
             "wave_step": self.wave_step,
             "combat_enabled": self.combat_enabled,
+            "sound_on": self.sound_on,
             "character": self.character,
+            "coins": self.coins,
+            "last_login": self.last_login,
+            "login_streak": self.login_streak,
+            "quest_date": self.quest_date,
+            "quest_progress": self.quest_progress,
+            "quest_claimed": self.quest_claimed,
+            "hud_offset_x": round(self.hud_offset_x, 1),
+            "hud_offset_y": round(self.hud_offset_y, 1),
         })
 
     # ------------------------------------------------------------------ loops
@@ -664,7 +815,10 @@ class World:
             self.pet.fullness = min(100, self.pet.fullness + 35)
             self.pet.happy = min(100, self.pet.happy + 12)
             self.show_bubble("อร่อย! 🍽")
+            sound.play("eat")
             self.add_xp(config.XP_PER_FEED)
+            self.add_coins(config.COINS_PER_FEED)
+            self._quest_advance("feed")
             food.destroy()
             self.food = None
             self.pet.eat_timer = None
@@ -695,12 +849,14 @@ class World:
                 m.hp -= dmg
                 self.pet.set_state("attack")
                 self.spawn_effect(m.x, m.top_y(), f"-{dmg}")
+                sound.play("attack")
                 self.pet.attack_cd = config.ATTACK_COOLDOWN
             if m.attack_cd == 0:                     # มอนสเตอร์โจมตี
                 self.pet.hp -= m.atk
                 self.pet.set_state("hurt")
                 self.pet.happy = max(0, self.pet.happy - 3)
                 self.spawn_effect(self.pet.x, self.pet.top_y(), f"-{m.atk}")
+                sound.play("hurt")
                 m.attack_cd = config.ATTACK_COOLDOWN
 
         m.sync_position()
@@ -708,6 +864,7 @@ class World:
         if m.hp <= 0:                                # ชนะ
             was_boss = m.is_boss
             self.spawn_effect(m.x, m.top_y(), "✨")
+            sound.play("win")
             m.destroy()
             self.monster = None
             self.pet.happy = min(100, self.pet.happy + 20)
@@ -720,10 +877,14 @@ class World:
                 self.show_bubble(f"🏆 ผ่านบอส! ขึ้นเวฟ {self.wave_round}")
                 self.spawn_effect(self.pet.x, self.pet.top_y(), "🎉")
                 self.add_xp(config.XP_PER_WIN * config.BOSS_XP_MULT)
+                self.add_coins(config.COINS_PER_BOSS)
+                self._quest_advance("boss")
             else:
                 self.wave_step += 1
                 self.show_bubble(f"ชนะ! ({self.wave_step}/{config.WAVE_LENGTH}) 🎉")
                 self.add_xp(config.XP_PER_WIN)
+                self.add_coins(config.COINS_PER_WIN)
+            self._quest_advance("kill")
             self._save_progress()
         elif self.pet.hp <= 0:                       # เพ็ทแพ้ (สลบ ไม่ตายถาวร)
             self.pet.set_state("hurt")
@@ -789,20 +950,36 @@ class World:
         pad = 6
         self.canvas.coords(rect, x0 - pad, y0 - pad, x1 + pad, y1 + pad)
 
+    def _close_all_menus(self):
+        """ปิดเมนู/ป๊อปอัปทุกอันในคอลัมน์ขวา (ใช้ก่อนเปิดอันใหม่ — เปิดได้ทีละอัน)"""
+        self.show_status_panel = False
+        self.show_actions = False
+        self._close_checkin_window()
+        self._close_quest_window()
+        self._close_shop_window()
+        self._close_settings_popup()
+        self._close_settings_window()
+        self._close_char_popup()
+
     def _toggle_status_panel(self, e):
-        """📊 เปิด/ปิดแผงสถานะ (ออกทางซ้าย)"""
-        self.show_status_panel = not self.show_status_panel
+        """📊 เปิด/ปิดแผงสถานะ (เปิด = ปิดเมนูอื่น)"""
+        want = not self.show_status_panel
+        self._close_all_menus()
+        self.show_status_panel = want
         self._draw_hud()
         return "break"
 
     def _toggle_actions(self, e):
-        """🍎 เปิด/ปิดเมนูให้อาหาร–ลูบหัว"""
-        self.show_actions = not self.show_actions
+        """🍎 เปิด/ปิดเมนูให้อาหาร–ลูบหัว (เปิด = ปิดเมนูอื่น)"""
+        want = not self.show_actions
+        self._close_all_menus()
+        self.show_actions = want
         self._draw_hud()
         return "break"
 
     def _toggle_combat(self, e):
         """⚔/🛡 สลับโหมดต่อสู้ ↔ เลี้ยงอย่างเดียว"""
+        self._close_all_menus()
         self.combat_enabled = not self.combat_enabled
         if not self.combat_enabled and self.monster is not None:
             self.monster.destroy()          # ปิดต่อสู้ = เอามอนสเตอร์ออกทันที
@@ -810,14 +987,14 @@ class World:
             if self.pet.behavior != "ko":
                 self.pet.behavior = "wander"
                 self.pet.vx = 0
-        self.show_bubble("⚔ เปิดโหมดต่อสู้!" if self.combat_enabled
-                         else "🛡 โหมดเลี้ยงอย่างเดียว")
+        self.show_bubble("⚔ พร้อมแล้ว!" if self.combat_enabled else "😴 พักผ่อน")
         self._save_progress()
         self._draw_hud()
         return "break"
 
     def _menu_click(self, action):
         """กดปุ่มเมนูซ้าย — สั่งงานแล้ววาดใหม่ทันที"""
+        sound.play("click")
         action()
         self._draw_hud()
         return "break"
@@ -827,6 +1004,7 @@ class World:
         if getattr(self, "_settings_win", None) is not None:
             self._close_settings_popup()
         else:
+            self._close_all_menus()
             self._show_settings_popup()
         return "break"
 
@@ -843,9 +1021,336 @@ class World:
         self._close_settings_popup()
         cmd()
 
+    # ------------------------------------------------------ เปิดเองตอนเปิดเครื่อง
+    def _autorun_lnk(self):
+        appdata = os.environ.get("APPDATA", "")
+        return os.path.join(appdata, "Microsoft", "Windows", "Start Menu",
+                            "Programs", "Startup", "MyDesktopPet.lnk")
+
+    def _is_autorun_enabled(self):
+        return os.path.exists(self._autorun_lnk())
+
+    def _set_autorun(self, on):
+        """สร้าง/ลบ ทางลัดใน Startup เพื่อเปิดโปรแกรมเองตอนเปิดเครื่อง"""
+        lnk = self._autorun_lnk()
+        if on:
+            if getattr(sys, "frozen", False):     # เป็น .exe แล้ว
+                target, args, workdir = sys.executable, "", os.path.dirname(sys.executable)
+            else:                                 # ยังรันเป็นสคริปต์ -> ใช้ตัวเรียก .vbs
+                vbs = paths.resource_path("start_pet.vbs")
+                target, args, workdir = "wscript.exe", f'"{vbs}"', paths.resource_path()
+            ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%s');"
+                  "$s.TargetPath='%s';$s.Arguments='%s';$s.WorkingDirectory='%s';$s.Save()"
+                  % (lnk, target, args.replace("'", "''"), workdir))
+            try:
+                subprocess.Popen(["powershell", "-NoProfile", "-Command", ps],
+                                 creationflags=0x08000000)
+            except Exception:
+                pass
+        else:
+            try:
+                os.remove(lnk)
+            except OSError:
+                pass
+
+    # ------------------------------------------------------------- หน้าตั้งค่า
+    def _close_settings_window(self):
+        w = getattr(self, "_settings_window", None)
+        self._settings_window = None
+        if w is not None:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+    def _show_settings_window(self):
+        """หน้าต่างตั้งค่า: เสียง / ความเร็วอนิเมชัน / เปิดเองตอนเปิดเครื่อง"""
+        if getattr(self, "_settings_window", None) is not None:
+            self._close_settings_window()
+            return
+        self._close_all_menus()
+        BG, FG, SUB = "#1e1e1e", "#ffffff", "#bbbbbb"
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.wm_attributes("-topmost", True)
+        win.configure(bg="#5a5a5a")
+        self._settings_window = win
+        fr = tk.Frame(win, bg=BG, padx=18, pady=16)
+        fr.pack(padx=2, pady=2)
+        tk.Label(fr, text="⚙  ตั้งค่า", bg=BG, fg=FG,
+                 font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(0, 12))
+
+        # 🔊 เสียง
+        snd = tk.BooleanVar(value=self.sound_on)
+
+        def on_snd():
+            self.sound_on = snd.get()
+            sound.set_enabled(self.sound_on)
+            self._save_progress()
+            if self.sound_on:
+                sound.play("click")
+        tk.Checkbutton(fr, text="  🔊  เปิดเสียง", variable=snd, command=on_snd,
+                       bg=BG, fg=FG, selectcolor="#2c3e50", activebackground=BG,
+                       activeforeground=FG, font=("Segoe UI", 12), anchor="w",
+                       bd=0, highlightthickness=0, cursor="hand2").pack(fill="x", pady=3)
+
+        # 🏃 ความเร็วอนิเมชัน (เฟรม/วินาที)
+        tk.Label(fr, text="🏃  ความเร็วอนิเมชัน (เฟรม/วิ)", bg=BG, fg=SUB,
+                 font=("Segoe UI", 11), anchor="w").pack(fill="x", pady=(10, 0))
+        spd = tk.Scale(fr, from_=2, to=20, orient="horizontal", bg=BG, fg=FG,
+                       troughcolor="#2c3e50", highlightthickness=0, bd=0,
+                       length=220, font=("Segoe UI", 9))
+        spd.set(max(2, min(20, round(1000 / max(1, config.ANIM_MS)))))
+
+        def on_spd(v):
+            config.ANIM_MS = int(1000 / max(2, int(float(v))))
+        spd.config(command=on_spd)
+        spd.pack(fill="x")
+
+        # 🚀 เปิดเองตอนเปิดเครื่อง
+        auto = tk.BooleanVar(value=self._is_autorun_enabled())
+
+        def on_auto():
+            self._set_autorun(auto.get())
+            sound.play("click")
+        tk.Checkbutton(fr, text="  🚀  เปิดเองตอนเปิดเครื่อง", variable=auto,
+                       command=on_auto, bg=BG, fg=FG, selectcolor="#2c3e50",
+                       activebackground=BG, activeforeground=FG, font=("Segoe UI", 12),
+                       anchor="w", bd=0, highlightthickness=0,
+                       cursor="hand2").pack(fill="x", pady=3)
+
+        tk.Button(fr, text="ปิด", command=self._close_settings_window, bg="#2c3e50",
+                  fg=FG, activebackground="#34495e", activeforeground=FG, bd=0,
+                  font=("Segoe UI", 11, "bold"), cursor="hand2",
+                  padx=20, pady=4).pack(pady=(14, 0))
+
+        self._center_popup(win)
+
+    def _center_popup(self, win):
+        """วางป๊อปอัป 'ข้างเมนู' (ตรงที่ผู้ใช้กด) + ดันขึ้นบนสุด — เห็นชัดทุกจอ"""
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        rx, ry = self.canvas.winfo_rootx(), self.canvas.winfo_rooty()
+        mx = getattr(self, "_hud_x1", -self.vx0 + self.primary_w - 18)
+        my = getattr(self, "_hud_y1", self.sh - 18)
+        x = rx + int(mx) - 42 - 12 - w       # ทางซ้ายของคอลัมน์เมนู
+        y = ry + int(my) - h                 # ชิดล่างเดียวกับเมนู
+        x = max(rx + 4, min(rx + self.sw - w - 4, x))
+        y = max(ry + 4, min(ry + self.sh - h - 4, y))
+        win.geometry(f"+{x}+{y}")
+        win.lift()
+        win.attributes("-topmost", True)
+        win.focus_force()
+
+    # ---------------------------------------------------------------- ร้านค้า
+    def _show_shop_window(self):
+        """ร้านค้า: ใช้เหรียญซื้อเติมอิ่ม/ฮีล/ชุบชีวิต"""
+        if getattr(self, "_shop_window", None) is not None:
+            self._close_shop_window()
+            return
+        self._close_all_menus()
+        BG, FG, SUB = "#1e1e1e", "#ffffff", "#bbbbbb"
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.wm_attributes("-topmost", True)
+        win.configure(bg="#5a5a5a")
+        self._shop_window = win
+        fr = tk.Frame(win, bg=BG, padx=18, pady=16)
+        fr.pack(padx=2, pady=2)
+        title = tk.Label(fr, bg=BG, fg="#f1c40f", font=("Segoe UI", 14, "bold"))
+        title.pack(anchor="w")
+        msg = tk.Label(fr, bg=BG, fg=SUB, font=("Segoe UI", 10))
+        msg.pack(anchor="w", pady=(0, 10))
+
+        def refresh():
+            title.config(text=f"🛒  ร้านค้า    🪙 {self.coins}")
+
+        def buy(price, label, action):
+            def do():
+                if self.coins < price:
+                    msg.config(text="เหรียญไม่พอ! สู้/ให้อาหารเพื่อเก็บเหรียญ", fg="#e74c3c")
+                    sound.play("hurt")
+                    return
+                self.coins -= price
+                action()
+                self._save_progress()
+                sound.play("eat")
+                msg.config(text=f"ซื้อ {label} แล้ว ✓", fg="#2ecc71")
+                refresh()
+                self._draw_hud()
+            return do
+
+        def buy_feed():
+            self.pet.fullness = 100
+            self.pet.happy = min(100, self.pet.happy + 10)
+        def buy_heal():
+            self.pet.hp = self.pet.max_hp()
+        def buy_revive():
+            if self.pet.behavior == "ko":
+                self.pet.ko_timer = 0
+            self.pet.hp = self.pet.max_hp()
+
+        rows = [
+            ("🍖  เติมอิ่มเต็ม", config.SHOP_PRICE_FEED, buy_feed),
+            ("🩹  ฮีลเลือดเต็ม", config.SHOP_PRICE_HEAL, buy_heal),
+            ("💖  ชุบชีวิต (ฟื้นจากสลบ)", config.SHOP_PRICE_REVIVE, buy_revive),
+        ]
+        for text, price, act in rows:
+            tk.Button(fr, text=f"{text}   {price} 🪙", anchor="w", justify="left",
+                      command=buy(price, text, act), bg="#2c3e50", fg=FG,
+                      activebackground="#34495e", activeforeground=FG, bd=0,
+                      font=("Segoe UI", 12), padx=12, pady=8, cursor="hand2",
+                      width=26).pack(fill="x", anchor="w", pady=3)
+
+        tk.Button(fr, text="ปิด", command=self._close_shop_window, bg="#3a3a3a",
+                  fg=FG, activebackground="#4a4a4a", activeforeground=FG, bd=0,
+                  font=("Segoe UI", 11, "bold"), cursor="hand2",
+                  padx=20, pady=4).pack(pady=(12, 0))
+        refresh()
+        self._center_popup(win)
+
+    def _close_shop_window(self):
+        w = getattr(self, "_shop_window", None)
+        self._shop_window = None
+        if w is not None:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------- เช็คอินรายวัน
+    def _close_checkin_window(self):
+        w = getattr(self, "_checkin_window", None)
+        self._checkin_window = None
+        if w is not None:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+    def _show_checkin_window(self):
+        if getattr(self, "_checkin_window", None) is not None:
+            self._close_checkin_window()
+            return
+        self._close_all_menus()
+        BG, FG, SUB = "#1e1e1e", "#ffffff", "#bbbbbb"
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.wm_attributes("-topmost", True)
+        win.configure(bg="#5a5a5a")
+        self._checkin_window = win
+        fr = tk.Frame(win, bg=BG, padx=20, pady=18)
+        fr.pack(padx=2, pady=2)
+        tk.Label(fr, text="📅  เช็คอินรายวัน", bg=BG, fg="#f1c40f",
+                 font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        info = tk.Label(fr, bg=BG, fg=SUB, font=("Segoe UI", 10))
+        info.pack(anchor="w", pady=(2, 12))
+
+        def refresh_info():
+            info.config(text=f"🔥 ติดต่อกัน {self.login_streak} วัน      🪙 {self.coins}")
+        refresh_info()
+        status = tk.Label(fr, bg=BG, fg=FG, font=("Segoe UI", 11))
+        status.pack(pady=(0, 8))
+
+        today = datetime.date.today()
+        yesterday = (today - datetime.timedelta(days=1)).isoformat()
+        pred_streak = self.login_streak + 1 if self.last_login == yesterday else 1
+        pred_reward = self._checkin_reward(pred_streak)
+
+        btn = tk.Button(fr, bd=0, font=("Segoe UI", 12, "bold"), cursor="hand2",
+                        padx=20, pady=8, fg=FG)
+
+        def claim():
+            r = self._claim_checkin()
+            if r:
+                self.show_bubble(f"🎁 เช็คอินวันที่ {self.login_streak}! +{r} 🪙")
+                status.config(text=f"รับ +{r} 🪙 แล้ว! 🎉", fg="#2ecc71")
+                btn.config(text="รับแล้ววันนี้ ✓", state="disabled",
+                           bg="#3a3a3a", activebackground="#3a3a3a")
+                refresh_info()
+                self._draw_hud()
+
+        if self._can_checkin():
+            status.config(text=f"รางวัลวันนี้: +{pred_reward} 🪙", fg="#f1c40f")
+            btn.config(text=f"รับรางวัล  (+{pred_reward} 🪙)", command=claim,
+                       bg="#2c7a51", activebackground="#349a66")
+        else:
+            status.config(text="รับรางวัลของวันนี้แล้ว — พรุ่งนี้มาใหม่นะ!", fg=SUB)
+            btn.config(text="รับแล้ววันนี้ ✓", state="disabled",
+                       bg="#3a3a3a", activebackground="#3a3a3a")
+        btn.pack()
+        tk.Label(fr, text="ล็อกอินติดกันทุกวัน รางวัลยิ่งเยอะ (พลาดวัน = เริ่มใหม่)",
+                 bg=BG, fg="#888", font=("Segoe UI", 9)).pack(pady=(10, 0))
+        tk.Button(fr, text="ปิด", command=self._close_checkin_window, bg="#2c3e50",
+                  fg=FG, activebackground="#34495e", bd=0, font=("Segoe UI", 11, "bold"),
+                  cursor="hand2", padx=20, pady=4).pack(pady=(12, 0))
+        self._center_popup(win)
+
+    # --------------------------------------------------------------- เควสรายวัน
+    def _close_quest_window(self):
+        w = getattr(self, "_quest_window", None)
+        self._quest_window = None
+        if w is not None:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+    def _show_quest_window(self):
+        if getattr(self, "_quest_window", None) is not None:
+            self._close_quest_window()
+            return
+        self._close_all_menus()
+        self._reset_quests_if_new_day()
+        BG, FG, SUB = "#1e1e1e", "#ffffff", "#bbbbbb"
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.wm_attributes("-topmost", True)
+        win.configure(bg="#5a5a5a")
+        self._quest_window = win
+        fr = tk.Frame(win, bg=BG, padx=20, pady=18)
+        fr.pack(padx=2, pady=2)
+        tk.Label(fr, text="📋  เควสรายวัน", bg=BG, fg="#f1c40f",
+                 font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        tk.Label(fr, text=f"🪙 {self.coins}      (รีเซ็ตทุกวัน)", bg=BG, fg=SUB,
+                 font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 10))
+
+        def reopen():
+            self._draw_hud()
+            self._close_quest_window()
+            self._show_quest_window()
+
+        for q in config.DAILY_QUESTS:
+            prog = min(self.quest_progress.get(q["id"], 0), q["goal"])
+            done = self._quest_done(q)
+            claimed = q["id"] in self.quest_claimed
+            row = tk.Frame(fr, bg=BG)
+            row.pack(fill="x", pady=4)
+            tk.Label(row, text=f"{q['icon']}  {q['label']}   {prog}/{q['goal']}",
+                     bg=BG, fg=FG if done else "#dddddd", font=("Segoe UI", 11),
+                     anchor="w", width=20).pack(side="left")
+            if claimed:
+                tk.Label(row, text="✓ รับแล้ว", bg=BG, fg="#2ecc71",
+                         font=("Segoe UI", 10, "bold")).pack(side="right")
+            elif done:
+                tk.Button(row, text=f"รับ +{q['reward']} 🪙",
+                          command=lambda qq=q: (self._claim_quest(qq), reopen()),
+                          bg="#2c7a51", fg=FG, activebackground="#349a66", bd=0,
+                          font=("Segoe UI", 10, "bold"), cursor="hand2",
+                          padx=10, pady=3).pack(side="right")
+            else:
+                tk.Label(row, text=f"+{q['reward']} 🪙", bg=BG, fg=SUB,
+                         font=("Segoe UI", 10)).pack(side="right")
+
+        tk.Button(fr, text="ปิด", command=self._close_quest_window, bg="#2c3e50",
+                  fg=FG, activebackground="#34495e", bd=0, font=("Segoe UI", 11, "bold"),
+                  cursor="hand2", padx=20, pady=4).pack(pady=(14, 0))
+        self._center_popup(win)
+
     def _show_settings_popup(self):
         """ป๊อปอัปตั้งค่าแบบกำหนดเอง: ธีมเข้ม มี hover เด้งเหนือปุ่ม ⚙"""
         items = [
+            ("⚙", "ตั้งค่า", self._show_settings_window, "#2c3e50"),
             ("🔄", "อัพเดทโปรแกรม", self.update_program, "#2c3e50"),
             ("ℹ", "เกี่ยวกับโปรแกรม", self.show_about, "#2c3e50"),
             ("sep", None, None, None),
@@ -878,8 +1383,9 @@ class World:
         y = rooty + gy0 - 6 - h                       # เหนือปุ่ม เว้น 6px
         win.geometry(f"{w}x{h}+{int(x)}+{int(y)}")
         self._settings_win = win
-        win.bind("<FocusOut>", lambda e: self._close_settings_popup())
         win.bind("<Escape>", lambda e: self._close_settings_popup())
+        win.lift()
+        win.attributes("-topmost", True)
         win.focus_force()
 
     def _draw_button(self, x0, y0, x1, y1, text, tag, enabled=True):
@@ -901,7 +1407,7 @@ class World:
                                      outline="#5a5a5a", width=2, tags=tags)
         self.canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=icon,
                                  fill="#ffffff" if enabled else "#6a6a6a",
-                                 font=("Segoe UI Emoji", 18), tags=tags)
+                                 font=("Segoe UI Emoji", 12), tags=tags)
 
     def _draw_pill(self, xr, yc, text, color):
         """ป้ายข้อความเล็ก พื้นเข้ม วางชิดขวาที่ตำแหน่ง (xr, yc)"""
@@ -917,29 +1423,37 @@ class World:
             self.canvas.tag_lower(r, t)
 
     def _draw_hud(self):
-        """แผงสถานะแบบติดมุมขวาล่างของ 'จอหลัก' (เห็นชัดเสมอ ไม่ติดตามเพ็ท)"""
+        """แผงสถานะมุมขวาล่าง — สไลด์เข้า/ออกจากขอบขวา (เปิด/ปิดที่ปุ่ม handle)"""
         self.canvas.delete("hud")
-        if not self.show_hud:
-            return
+        self.canvas.delete("hudedge")
         p = self.pet
         margin = 18
         # มุมขวาล่างของจอหลัก; ใช้ขอบบน taskbar เป็นฐานล่าง (แผงจึงอยู่เหนือ taskbar)
         right = -self.vx0 + self.primary_w
         bottom = self._work_bottom_at(right - margin)
 
-        x1, y1 = right - margin, bottom - margin
-
-        # ===== คอลัมน์ปุ่มไอคอนแนวตั้ง (ชิดขวาล่าง เรียงขึ้นบน) =====
-        bw, gap = 44, 8
+        # ===== คอลัมน์ปุ่มไอคอนแนวตั้ง (ลากย้ายได้ด้วยปุ่ม ☰) =====
+        bw, gap = 30, 5
+        col_h = 8 * (bw + gap)                 # ความสูงคอลัมน์ทั้งหมด (8 ปุ่ม)
+        # ตำแหน่งมุมขวาล่างของคอลัมน์ = ค่าเริ่มต้น (มุมขวาล่าง) + ระยะที่ลากย้าย แล้ว clamp ให้อยู่ในจอ
+        x1 = max(bw + 4, min(self.sw - 2, (right - margin) + self.hud_offset_x))
+        y1 = max(col_h + 4, min(self.sh - 2, (bottom - margin) + self.hud_offset_y))
+        self.hud_offset_x = x1 - (right - margin)   # เขียนกลับค่าที่ clamp แล้ว
+        self.hud_offset_y = y1 - (bottom - margin)
+        self._hud_x1, self._hud_y1 = x1, y1         # เก็บไว้วางป๊อปอัปข้างเมนู
 
         def col_rect(i):                       # i=0 = ล่างสุด
             btm = y1 - i * (bw + gap)
             return (x1 - bw, btm - bw, x1, btm)
 
-        sx0, sy0, sx1, sy1 = col_rect(0)       # ⚙ ตั้งค่า
-        cx0, cy0, cx1, cy1 = col_rect(1)       # ⚔ ต่อสู้
-        ax0, ay0, ax1, ay1 = col_rect(2)       # 🍎 เลี้ยง
-        tx0, ty0, tx1, ty1 = col_rect(3)       # 📊 สถานะ
+        self._hud_handle_rect = col_rect(0)    # ◀/▶ เปิด-ปิด (ล่างสุด) — ไม่สไลด์
+        sx0, sy0, sx1, sy1 = col_rect(1)       # ⚙ ตั้งค่า
+        hx0, hy0, hx1, hy1 = col_rect(2)       # 🛒 ร้านค้า
+        qbx0, qby0, qbx1, qby1 = col_rect(3)   # 📋 เควส
+        kx0, ky0, kx1, ky1 = col_rect(4)       # 📅 เช็คอิน
+        cx0, cy0, cx1, cy1 = col_rect(5)       # ⚔ ต่อสู้
+        ax0, ay0, ax1, ay1 = col_rect(6)       # 🍎 เลี้ยง
+        tx0, ty0, tx1, ty1 = col_rect(7)       # 📊 สถานะ
 
         self._draw_icon_button(tx0, ty0, tx1, ty1, "📊", "btn_status",
                                accent=self.show_status_panel)
@@ -948,19 +1462,13 @@ class World:
         self._draw_icon_button(cx0, cy0, cx1, cy1,
                                "⚔" if self.combat_enabled else "🛡", "btn_combat",
                                accent=self.combat_enabled, accent_color="#c0392b")
+        self._draw_icon_button(kx0, ky0, kx1, ky1, "📅", "btn_checkin",
+                               accent=self._can_checkin(), accent_color="#b8860b")
+        self._draw_icon_button(qbx0, qby0, qbx1, qby1, "📋", "btn_quest",
+                               accent=self._any_quest_claimable(), accent_color="#2c7a51")
+        self._draw_icon_button(hx0, hy0, hx1, hy1, "🛒", "btn_shop")
         self._draw_icon_button(sx0, sy0, sx1, sy1, "⚙", "btn_settings")
         self._gear_canvas = (sx0, sy0, sx1, sy1)   # ไว้วางเมนูตั้งค่าเหนือปุ่ม
-
-        # ===== ป้ายเวฟ/โหมด: ซ้ายของปุ่ม ⚔ (แสดงจำนวนเวฟ) =====
-        if self.combat_enabled:
-            if self.monster is not None and self.monster.is_boss:
-                wtext = f"⚔ เวฟ {self.wave_round} · 👑 บอส"
-            else:
-                wtext = f"⚔ เวฟ {self.wave_round} · {self.wave_step}/{config.WAVE_LENGTH}"
-            wcolor = "#f1c40f"
-        else:
-            wtext, wcolor = "🛡 โหมดเลี้ยง", "#9aa0a6"
-        self._draw_pill(cx0 - 10, (cy0 + cy1) / 2, wtext, wcolor)
 
         # ===== 🍎 เมนูเลี้ยง: ไอคอน ✋/🍎 ออกซ้ายจากปุ่ม (แถวเดียวกัน) =====
         if self.show_actions:
@@ -994,6 +1502,15 @@ class World:
                                     text=f"{char_name}   Lv.{p.level}",
                                     fill="#ffffff", font=("Segoe UI", 14, "bold"),
                                     tags="hud")
+            # เหรียญ (มุมขวาบนของแผง) + สตรีคล็อกอิน
+            self.canvas.create_text(qx1 - 14, qy0 + 22, anchor="e",
+                                    text=f"🪙 {self.coins}", fill="#f1c40f",
+                                    font=("Segoe UI", 12, "bold"), tags="hud")
+            if self.login_streak > 1:
+                self.canvas.create_text(qx1 - 14, qy0 + 40, anchor="e",
+                                        text=f"🔥 {self.login_streak} วัน",
+                                        fill="#e67e22", font=("Segoe UI", 9, "bold"),
+                                        tags="hud")
             rows = [
                 ("HP", p.alive_ratio(), "#e74c3c", f"{int(p.hp)}/{p.max_hp()}"),
                 ("อิ่ม", p.fullness / 100.0, "#f39c12", f"{int(p.fullness)}"),
@@ -1015,6 +1532,12 @@ class World:
                 self.canvas.create_text(bar_x + bar_w / 2, cy + bar_h / 2, text=text,
                                         fill="#ffffff", font=("Segoe UI", 10, "bold"),
                                         tags="hud")
+
+        # ===== ปิด = ซ่อนทุกปุ่มทันที เหลือแค่ ☰ (ไม่มีอนิเมชัน) =====
+        if not self.show_hud:
+            self.canvas.delete("hud")
+        # ปุ่มเมนู ☰ (วาดทับบนสุด เห็นตลอด กดเพื่อเปิด/ปิด)
+        self._draw_edge_handle(self._hud_handle_rect)
 
     # ----------------------------------------------------------- hunger alert
     def _check_hunger(self):

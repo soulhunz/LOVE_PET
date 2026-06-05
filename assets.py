@@ -7,9 +7,11 @@
 import glob
 import os
 import re
+import shutil
 import tkinter as tk
 
 import config
+import paths
 
 _BROWN = "#8a5a2b"
 _GREEN = "#3fa34d"
@@ -183,29 +185,50 @@ def _slice_sheet(sheet, count=None):
     return frames
 
 
+# assets/ = ไฟล์ที่มากับโปรแกรม (อ่านอย่างเดียว) | characters/ = ของผู้ใช้ (เขียนได้ ที่ %APPDATA%)
+def _assets_dir():
+    return paths.resource_path(config.ASSETS_DIR)
+
+
+def _characters_root():
+    """โฟลเดอร์รวมตัวละครของผู้ใช้ (ที่ %APPDATA%) — คัดลอกตัวอย่างที่มากับโปรแกรมมาให้ครั้งแรก"""
+    root = paths.data_path(config.CHARACTERS_DIR)
+    try:
+        os.makedirs(root, exist_ok=True)
+        bundled = paths.resource_path(config.CHARACTERS_DIR)
+        if os.path.isdir(bundled):
+            for name in os.listdir(bundled):
+                src = os.path.join(bundled, name)
+                dst = os.path.join(root, name)
+                if os.path.isdir(src) and not os.path.exists(dst):
+                    shutil.copytree(src, dst)      # seed ตัวอย่างตัวละคร (ถ้ายังไม่มี)
+    except OSError:
+        pass
+    return root
+
+
 # โฟลเดอร์ที่ใช้ค้นไฟล์ภาพ เรียงตามลำดับความสำคัญ (ตั้งค่าได้ตอนรันด้วย set_character_dir)
-# ค่าเริ่มต้น = เฉพาะ ASSETS_DIR; ถ้าเลือกตัวละคร จะค้นโฟลเดอร์ตัวละครก่อน แล้วค่อย assets
 _search_dirs = None
 
 
 def set_character_dir(path):
     """กำหนดโฟลเดอร์ตัวละครที่กำลังใช้ (ค้นก่อน assets/); path=None = ใช้ assets/ อย่างเดียว"""
     global _search_dirs
-    _search_dirs = [path, config.ASSETS_DIR] if path else [config.ASSETS_DIR]
+    _search_dirs = [path, _assets_dir()] if path else [_assets_dir()]
 
 
 def _dirs():
-    return _search_dirs if _search_dirs else [config.ASSETS_DIR]
+    return _search_dirs if _search_dirs else [_assets_dir()]
 
 
 def character_path(name):
-    """เส้นทางโฟลเดอร์ของตัวละครชื่อ name"""
-    return os.path.join(config.CHARACTERS_DIR, name)
+    """เส้นทางโฟลเดอร์ของตัวละครชื่อ name (ในโฟลเดอร์ข้อมูลผู้ใช้)"""
+    return os.path.join(_characters_root(), name)
 
 
 def list_characters():
-    """คืนรายชื่อโฟลเดอร์ตัวละครใน characters/ (เรียงตามชื่อ); ไม่มีก็คืนลิสต์ว่าง"""
-    root = config.CHARACTERS_DIR
+    """คืนรายชื่อโฟลเดอร์ตัวละคร (เรียงตามชื่อ); ไม่มีก็คืนลิสต์ว่าง"""
+    root = _characters_root()
     if not os.path.isdir(root):
         return []
     return sorted(d for d in os.listdir(root)
