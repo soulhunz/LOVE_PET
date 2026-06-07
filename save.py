@@ -1,10 +1,23 @@
 # -*- coding: utf-8 -*-
-"""บันทึก/โหลดความคืบหน้า (เลเวล, XP, สเตตัส) ลงไฟล์ save.json"""
+"""บันทึก/โหลดความคืบหน้า (เลเวล, XP, สเตตัส) ลงไฟล์ save.json
+เก็บที่ %APPDATA%/MyDesktopPet เพื่อให้เขียนได้แม้ติดตั้งใน Program Files (.exe)"""
 import json
 import os
 
-# อิงโฟลเดอร์โปรแกรม (main.py ตั้ง working dir ไว้แล้ว) — เขียนได้ทั้งตอนรันสคริปต์และเป็น .exe
-SAVE_PATH = os.path.abspath("save.json")
+import paths
+
+SAVE_PATH = paths.data_path("save.json")
+
+# ย้ายเซฟเก่าที่เคยอยู่ข้างโปรแกรมมาที่ใหม่ (ครั้งแรกที่อัปเกรด)
+_OLD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "save.json")
+if os.path.exists(_OLD) and not os.path.exists(SAVE_PATH):
+    try:
+        with open(_OLD, encoding="utf-8") as _f:
+            _data = _f.read()
+        with open(SAVE_PATH, "w", encoding="utf-8") as _f:
+            _f.write(_data)
+    except OSError:
+        pass
 
 
 def load():
@@ -17,9 +30,17 @@ def load():
 
 
 def save(data):
-    """เขียนข้อมูลลงไฟล์เซฟ (เงียบ ๆ ถ้าเขียนไม่ได้ เพื่อไม่ให้โปรแกรมล่ม)"""
+    """เขียนข้อมูลลงไฟล์เซฟแบบ atomic (เขียนไฟล์ชั่วคราวก่อนแล้วค่อยสลับทับ)
+    กันไฟล์เซฟพังถ้าโปรแกรมดับกลางคันระหว่างเขียน (เงียบ ๆ ถ้าเขียนไม่ได้)"""
+    tmp = SAVE_PATH + ".tmp"
     try:
-        with open(SAVE_PATH, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, SAVE_PATH)   # สลับทับแบบ atomic บนไฟล์ระบบเดียวกัน
     except OSError:
-        pass
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass

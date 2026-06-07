@@ -7,9 +7,11 @@
 import glob
 import os
 import re
+import shutil
 import tkinter as tk
 
 import config
+import paths
 
 _BROWN = "#8a5a2b"
 _GREEN = "#3fa34d"
@@ -76,23 +78,10 @@ def _keyout_bg(img):
 
 
 def _flatten_alpha(img):
-    """แบน PNG ที่มี alpha: พิกเซลโปร่งใส -> สีคีย์, พิกเซลทึบ -> คงสีเดิม"""
-    w, h = img.width(), img.height()
-    key = config.TRANSPARENT_KEY
-    tget, pixel = img.transparency_get, _pixel
-    rows = []
-    for y in range(h):
-        row = []
-        for x in range(w):
-            if tget(x, y):
-                row.append(key)
-            else:
-                r, g, b = pixel(img, x, y)
-                row.append(f"#{r:02x}{g:02x}{b:02x}")
-        rows.append("{" + " ".join(row) + "}")
-    out = tk.PhotoImage(width=w, height=h)
-    out.put(" ".join(rows))
-    return out
+    """PNG ที่มี alpha: คง alpha เดิมไว้ (ไม่แปลงเป็นสีคีย์)
+    Tk จะประกบ (composite) ภาพโปร่งทับตัวละครตัวอื่นได้ถูกต้อง — ตัวซ้อนกันไม่บังกัน
+    (เดิมแปลงเป็น magenta ทำให้พื้นสี่เหลี่ยมเจาะทะลุไปเดสก์ท็อปบังตัวอื่น)"""
+    return img
 
 
 def _flood_keyout(img, tol):
@@ -120,19 +109,37 @@ def _flood_keyout(img, tol):
             if 0 <= nx < w and 0 <= ny < h and not clear[ny][nx] and is_bg(px[ny][nx]):
                 clear[ny][nx] = True; stack.append((nx, ny))
 
-    key = config.TRANSPARENT_KEY
-    rows = []
+    # ลบ "ขอบรุ่งริ่ง" (halo จาก anti-aliasing): พิกเซลที่ติดกับพื้นโปร่งแล้ว
+    # และสีใกล้พื้น (เกณฑ์หลวมกว่า) ให้ลบออกด้วย — ทำ 2 รอบ ตัดให้สนิทขึ้น
+    halo = tol * 2
+    for _ in range(2):
+        edge = []
+        for y in range(h):
+            for x in range(w):
+                if clear[y][x]:
+                    continue
+                if not ((x > 0 and clear[y][x - 1]) or (x < w - 1 and clear[y][x + 1])
+                        or (y > 0 and clear[y - 1][x]) or (y < h - 1 and clear[y + 1][x])):
+                    continue
+                c = px[y][x]
+                if abs(c[0] - br) + abs(c[1] - bg_) + abs(c[2] - bb) <= halo:
+                    edge.append((x, y))
+        for x, y in edge:
+            clear[y][x] = True
+
+    rows, trans = [], []
     for y in range(h):
         row = []
         for x in range(w):
+            r, g, b = px[y][x]
+            row.append(f"#{r:02x}{g:02x}{b:02x}")
             if clear[y][x]:
-                row.append(key)
-            else:
-                r, g, b = px[y][x]
-                row.append(f"#{r:02x}{g:02x}{b:02x}")
+                trans.append((x, y))
         rows.append("{" + " ".join(row) + "}")
     out = tk.PhotoImage(width=w, height=h)
     out.put(" ".join(rows))
+    for x, y in trans:                       # ตั้งโปร่งใสจริง (โชว์ตัวที่อยู่ข้างหลังได้)
+        out.transparency_set(x, y, True)
     return out
 
 
@@ -183,33 +190,248 @@ def _slice_sheet(sheet, count=None):
     return frames
 
 
+# assets/ = ไฟล์ที่มากับโปรแกรม (อ่านอย่างเดียว) | characters/ = ของผู้ใช้ (เขียนได้ ที่ %APPDATA%)
+def _assets_dir():
+    return paths.resource_path(config.ASSETS_DIR)
+
+
+def _characters_root():
+    """โฟลเดอร์รวมตัวละครของผู้ใช้ (ที่ %APPDATA%) — คัดลอกตัวอย่างที่มากับโปรแกรมมาให้ครั้งแรก"""
+    root = paths.data_path(config.CHARACTERS_DIR)
+    try:
+        os.makedirs(root, exist_ok=True)
+        bundled = paths.resource_path(config.CHARACTERS_DIR)
+        if os.path.isdir(bundled):
+            for name in os.listdir(bundled):
+                src = os.path.join(bundled, name)
+                dst = os.path.join(root, name)
+                if os.path.isdir(src) and not os.path.exists(dst):
+                    shutil.copytree(src, dst)      # seed ตัวอย่างตัวละคร (ถ้ายังไม่มี)
+    except OSError:
+        pass
+    return root
+
+
 # โฟลเดอร์ที่ใช้ค้นไฟล์ภาพ เรียงตามลำดับความสำคัญ (ตั้งค่าได้ตอนรันด้วย set_character_dir)
-# ค่าเริ่มต้น = เฉพาะ ASSETS_DIR; ถ้าเลือกตัวละคร จะค้นโฟลเดอร์ตัวละครก่อน แล้วค่อย assets
 _search_dirs = None
 
 
 def set_character_dir(path):
     """กำหนดโฟลเดอร์ตัวละครที่กำลังใช้ (ค้นก่อน assets/); path=None = ใช้ assets/ อย่างเดียว"""
     global _search_dirs
-    _search_dirs = [path, config.ASSETS_DIR] if path else [config.ASSETS_DIR]
+    _search_dirs = [path, _assets_dir()] if path else [_assets_dir()]
 
 
 def _dirs():
-    return _search_dirs if _search_dirs else [config.ASSETS_DIR]
+    return _search_dirs if _search_dirs else [_assets_dir()]
 
 
 def character_path(name):
-    """เส้นทางโฟลเดอร์ของตัวละครชื่อ name"""
-    return os.path.join(config.CHARACTERS_DIR, name)
+    """เส้นทางโฟลเดอร์ของตัวละครชื่อ name (ในโฟลเดอร์ข้อมูลผู้ใช้)"""
+    return os.path.join(_characters_root(), name)
 
 
 def list_characters():
-    """คืนรายชื่อโฟลเดอร์ตัวละครใน characters/ (เรียงตามชื่อ); ไม่มีก็คืนลิสต์ว่าง"""
-    root = config.CHARACTERS_DIR
+    """คืนรายชื่อโฟลเดอร์ตัวละคร (เรียงตามชื่อ); ไม่มีก็คืนลิสต์ว่าง"""
+    root = _characters_root()
     if not os.path.isdir(root):
         return []
     return sorted(d for d in os.listdir(root)
                   if os.path.isdir(os.path.join(root, d)))
+
+
+# ---------------------------------------------------------------------------
+# มอนสเตอร์หลายแบบ (โฟลเดอร์ต่อตัว ใน monsters/)
+# ---------------------------------------------------------------------------
+MONSTERS_DIR = "monsters"
+
+
+def _monsters_root():
+    """โฟลเดอร์รวมมอนสเตอร์ของผู้ใช้ (ที่ %APPDATA%) — คัดลอกตัวอย่างที่มากับโปรแกรมให้ครั้งแรก"""
+    root = paths.data_path(MONSTERS_DIR)
+    try:
+        os.makedirs(root, exist_ok=True)
+        bundled = paths.resource_path(MONSTERS_DIR)
+        if os.path.isdir(bundled):
+            for name in os.listdir(bundled):
+                src = os.path.join(bundled, name)
+                dst = os.path.join(root, name)
+                if os.path.isdir(src) and not os.path.exists(dst):
+                    shutil.copytree(src, dst)
+    except OSError:
+        pass
+    return root
+
+
+def monster_path(name):
+    return os.path.join(_monsters_root(), name)
+
+
+def add_monster(name, files):
+    """สร้างมอนใหม่: name=ชื่อโฟลเดอร์, files={'walk':path,'hurt':path} คัดลอกไฟล์เข้าไป
+    คืนชื่อที่ใช้จริง หรือ None ถ้าล้มเหลว"""
+    safe = "".join(c for c in (name or "").strip() if c not in '\\/:*?"<>|')[:24]
+    if not safe:
+        return None
+    walk = files.get("walk")
+    if not (walk and os.path.isfile(walk)):
+        return None
+    d = monster_path(safe)
+    try:
+        os.makedirs(d, exist_ok=True)
+        for slot in ("walk", "hurt"):
+            src = files.get(slot)
+            if src and os.path.isfile(src):
+                ext = os.path.splitext(src)[1].lower() or ".png"
+                shutil.copy(src, os.path.join(d, slot + ext))
+    except OSError:
+        return None
+    return safe
+
+
+def delete_monster(name):
+    try:
+        shutil.rmtree(monster_path(name))
+    except OSError:
+        pass
+
+
+def list_monsters():
+    """คืนรายชื่อโฟลเดอร์มอนสเตอร์ (เฉพาะที่มีไฟล์ภาพอยู่จริง)"""
+    root = _monsters_root()
+    if not os.path.isdir(root):
+        return []
+    out = []
+    for d in sorted(os.listdir(root)):
+        p = os.path.join(root, d)
+        if os.path.isdir(p) and (glob.glob(os.path.join(p, "*.png"))
+                                 or glob.glob(os.path.join(p, "*.gif"))):
+            out.append(d)
+    return out
+
+
+def add_character(name, files, meta=None):
+    """สร้างตัวละครใหม่: name=ชื่อโฟลเดอร์, files={'idle':path,'walk':...,'attack':...,
+    'dead':...,'taken':...} คัดลอกเป็น pet_<slot>.<ext>; meta=dict → เขียน pet.json
+    คืนชื่อที่ใช้จริง หรือ None ถ้าล้มเหลว (ต้องมีอย่างน้อย idle)"""
+    import json
+    safe = "".join(c for c in (name or "").strip() if c not in '\\/:*?"<>|')[:24]
+    if not safe:
+        return None
+    idle = files.get("idle")
+    if not (idle and os.path.isfile(idle)):
+        return None
+    d = character_path(safe)
+    try:
+        os.makedirs(d, exist_ok=True)
+        for slot in ("idle", "walk", "attack", "hurt", "eat", "dead", "taken",
+                     "sleep", "bathe", "pet"):
+            src = files.get(slot)
+            if src and os.path.isfile(src):
+                ext = os.path.splitext(src)[1].lower() or ".png"
+                # เก็บ marker จำนวนเฟรมจากชื่อไฟล์ต้นฉบับไว้ (เช่น _strip3) ไม่งั้น sprite sheet เพี้ยน
+                n = _frame_count_from_name(src)
+                suffix = f"_strip{n}" if n and n > 1 else ""
+                dst = os.path.join(d, "pet_" + slot + suffix + ext)
+                if os.path.abspath(src) == os.path.abspath(dst):
+                    continue                  # ใช้ไฟล์เดิม (ตอนแก้ไข) ไม่ต้องคัดลอกทับตัวเอง
+                for old in glob.glob(os.path.join(d, "pet_" + slot + "*.*")):
+                    try:
+                        os.remove(old)        # ลบรูปสถานะเดิม (ทุกนามสกุล/marker) กันค้างหลายไฟล์
+                    except OSError:
+                        pass
+                shutil.copy(src, dst)
+        if meta:
+            with open(os.path.join(d, "pet.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+    except OSError:
+        return None
+    return safe
+
+
+def delete_character(name):
+    try:
+        shutil.rmtree(character_path(name))
+    except OSError:
+        pass
+
+
+def character_has_idle(name):
+    """ตัวละครนี้มีรูป idle อยู่แล้วหรือไม่ (ใช้ตอนแก้ไข จะได้ไม่บังคับเลือกใหม่)"""
+    d = character_path(name)
+    return bool(glob.glob(os.path.join(d, "pet_idle.*"))
+                or glob.glob(os.path.join(d, "pet_idle_*.*")))
+
+
+def character_slot_file(name, slot):
+    """ชื่อไฟล์รูปของสถานะ slot ที่ตัวละครมีอยู่ (รองรับ marker เช่น pet_attack_strip3.png) หรือ None"""
+    d = character_path(name)
+    found = sorted(glob.glob(os.path.join(d, f"pet_{slot}.*"))
+                   + glob.glob(os.path.join(d, f"pet_{slot}_*.*")))
+    return os.path.basename(found[0]) if found else None
+
+
+def rename_character(old, new):
+    """เปลี่ยนชื่อโฟลเดอร์ตัวละคร — คืนชื่อใหม่ที่ใช้จริง หรือ None ถ้าทำไม่ได้"""
+    safe = "".join(c for c in (new or "").strip() if c not in '\\/:*?"<>|')[:24]
+    if not safe or safe == old:
+        return old if safe == old else None
+    src, dst = character_path(old), character_path(safe)
+    if os.path.exists(dst):
+        return None
+    try:
+        os.rename(src, dst)
+    except OSError:
+        return None
+    return safe
+
+
+def character_rarity(name):
+    """ระดับความหายากของตัวละคร (จาก pet.json) — คืน id (default 'common')"""
+    rid = (load_character_meta(name) or {}).get("rarity", "common")
+    return rid if rid in {r["id"] for r in config.RARITIES} else "common"
+
+
+def set_character_meta(name, updates):
+    """อัปเดต pet.json ของตัวละคร (รวมกับของเดิม) — เช่นตั้งค่า rarity/likes"""
+    import json
+    if not name:
+        return
+    meta = load_character_meta(name) or {}
+    meta.update(updates)
+    path = os.path.join(character_path(name), "pet.json")
+    try:
+        os.makedirs(character_path(name), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def load_character_meta(name):
+    """อ่านไฟล์ pet.json ของตัวละคร (ความชอบอาหาร/ระดับ ฯลฯ) — คืน dict ว่างถ้าไม่มี/อ่านไม่ได้
+    รูปแบบ: {"likes": ["fish"], "dislikes": ["veggie"], "rarity": "rare", "display": "ชื่อโชว์"}"""
+    import json
+    if not name:
+        return {}
+    path = os.path.join(character_path(name), "pet.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def load_asset_sprite(candidates):
+    """โหลดสไปรต์จากโฟลเดอร์ assets/ โดยตรง (ไม่อิงตัวละครที่เลือกอยู่) — เช่นรูปไข่"""
+    global _search_dirs
+    saved = _search_dirs
+    _search_dirs = [_assets_dir()]
+    try:
+        return load_sprite(candidates)
+    finally:
+        _search_dirs = saved
 
 
 def _resolve_path(name):
@@ -306,6 +528,7 @@ def _make_blob_frames(size, body_hex, *, eyes=True, brows=False, stem=False, cou
         cy = size * 0.52
 
         rows = []
+        trans = []
         for y in range(size):
             row = []
             for x in range(size):
@@ -321,6 +544,7 @@ def _make_blob_frames(size, body_hex, *, eyes=True, brows=False, stem=False, cou
                         row.append(body_hex)
                 else:
                     row.append(key)
+                    trans.append((x, y))
             rows.append("{" + " ".join(row) + "}")
 
         img = tk.PhotoImage(width=size, height=size)
@@ -334,6 +558,8 @@ def _make_blob_frames(size, body_hex, *, eyes=True, brows=False, stem=False, cou
         if eyes:
             _draw_eyes(img, cx, cy, rx, ry, size, eye_states[f % len(eye_states)], brows)
 
+        for x, y in trans:                   # พื้นรอบตัว = โปร่งจริง (ไม่บังตัวอื่นตอนซ้อน)
+            img.transparency_set(x, y, True)
         frames.append(img)
     return frames
 
