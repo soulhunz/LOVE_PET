@@ -15,6 +15,15 @@ import os
 import sys
 import traceback
 
+# ทำให้ path สัมพัทธ์ (assets/ characters/ save.json) ชี้ไปที่ "โฟลเดอร์โปรแกรม" เสมอ
+# ทั้งตอนรันสคริปต์ปกติ และตอนเป็นไฟล์ .exe (PyInstaller) ที่ดับเบิลคลิกจากที่ไหนก็ได้
+_APP_DIR = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+            else os.path.dirname(os.path.abspath(__file__)))
+try:
+    os.chdir(_APP_DIR)
+except OSError:
+    pass
+
 
 def main():
     from game import World

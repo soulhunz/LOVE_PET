@@ -3,7 +3,8 @@
 import json
 import os
 
-SAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "save.json")
+# อิงโฟลเดอร์โปรแกรม (main.py ตั้ง working dir ไว้แล้ว) — เขียนได้ทั้งตอนรันสคริปต์และเป็น .exe
+SAVE_PATH = os.path.abspath("save.json")
 
 
 def load():
