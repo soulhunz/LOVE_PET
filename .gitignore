@@ -9,3 +9,9 @@ error.log
 
 # Windows shortcuts
 *.lnk
+
+# Build artifacts (do NOT commit - they are stale snapshots)
+build/
+dist/
+*.exe
+*.spec
