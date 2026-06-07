@@ -30,9 +30,17 @@ def load():
 
 
 def save(data):
-    """เขียนข้อมูลลงไฟล์เซฟ (เงียบ ๆ ถ้าเขียนไม่ได้ เพื่อไม่ให้โปรแกรมล่ม)"""
+    """เขียนข้อมูลลงไฟล์เซฟแบบ atomic (เขียนไฟล์ชั่วคราวก่อนแล้วค่อยสลับทับ)
+    กันไฟล์เซฟพังถ้าโปรแกรมดับกลางคันระหว่างเขียน (เงียบ ๆ ถ้าเขียนไม่ได้)"""
+    tmp = SAVE_PATH + ".tmp"
     try:
-        with open(SAVE_PATH, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, SAVE_PATH)   # สลับทับแบบ atomic บนไฟล์ระบบเดียวกัน
     except OSError:
-        pass
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
