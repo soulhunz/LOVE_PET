@@ -267,23 +267,53 @@ def monster_path(name):
     return os.path.join(_monsters_root(), name)
 
 
-def add_monster(name, files):
-    """สร้างมอนใหม่: name=ชื่อโฟลเดอร์, files={'walk':path,'hurt':path} คัดลอกไฟล์เข้าไป
-    คืนชื่อที่ใช้จริง หรือ None ถ้าล้มเหลว"""
+# สถานะรูปของมอนสเตอร์ (เหมือนตัวละครแต่ไม่มีอาหาร): ยืน/เดิน/โจมตี/เจ็บ/ติด CC/ตาย
+MONSTER_SLOTS = ("idle", "walk", "attack", "hurt", "cc", "dead")
+
+
+def load_monster_meta(name):
+    """อ่าน monster.json ของมอน (rarity/range_type/skill) — คืน dict ว่างถ้าไม่มี/อ่านไม่ได้"""
+    import json
+    if not name:
+        return {}
+    try:
+        with open(os.path.join(monster_path(name), "monster.json"), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def add_monster(name, files, meta=None):
+    """สร้าง/แก้มอน: name=ชื่อโฟลเดอร์, files={slot:path,...} (idle/walk/attack/hurt/cc/dead),
+    meta=dict → เขียน monster.json (rarity/range_type/skill)
+    ต้องมีอย่างน้อย 'เดิน' หรือ 'ยืน' — คืนชื่อที่ใช้จริง หรือ None ถ้าล้มเหลว"""
+    import json
     safe = "".join(c for c in (name or "").strip() if c not in '\\/:*?"<>|')[:24]
     if not safe:
         return None
-    walk = files.get("walk")
-    if not (walk and os.path.isfile(walk)):
+    base = files.get("walk") or files.get("idle")
+    if not (base and os.path.isfile(base)):
         return None
     d = monster_path(safe)
     try:
         os.makedirs(d, exist_ok=True)
-        for slot in ("walk", "hurt"):
+        for slot in MONSTER_SLOTS:
             src = files.get(slot)
             if src and os.path.isfile(src):
                 ext = os.path.splitext(src)[1].lower() or ".png"
-                shutil.copy(src, os.path.join(d, slot + ext))
+                dst = os.path.join(d, slot + ext)
+                if os.path.abspath(src) == os.path.abspath(dst):
+                    continue                  # ใช้ไฟล์เดิม (ตอนแก้ไข) ไม่ต้องคัดลอกทับตัวเอง
+                for old in glob.glob(os.path.join(d, slot + ".*")):
+                    try:
+                        os.remove(old)        # ลบรูปสล็อตเดิม (กันค้างหลายนามสกุล)
+                    except OSError:
+                        pass
+                shutil.copy(src, dst)
+        if meta is not None:
+            with open(os.path.join(d, "monster.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
     except OSError:
         return None
     return safe
@@ -410,7 +440,8 @@ def set_character_meta(name, updates):
 
 def load_character_meta(name):
     """อ่านไฟล์ pet.json ของตัวละคร (ความชอบอาหาร/ระดับ ฯลฯ) — คืน dict ว่างถ้าไม่มี/อ่านไม่ได้
-    รูปแบบ: {"likes": ["fish"], "dislikes": ["veggie"], "rarity": "rare", "display": "ชื่อโชว์"}"""
+    รูปแบบ: {"likes": ["fish"], "dislikes": ["veggie"], "rarity": "rare", "display": "ชื่อโชว์",
+             "skills": ["berserk", "venom"]}  ← จำกัดกองสุ่มสกิลของตัวละครนี้ (ว่าง/ไม่มี = กองรวม)"""
     import json
     if not name:
         return {}
@@ -421,6 +452,107 @@ def load_character_meta(name):
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+# ---------------------------------------------------------------------------
+# ระบบสกิล (data-driven) — โหลด/ผสานจาก assets/skills.json ทับค่าเริ่มต้นใน config.SKILLS
+# ---------------------------------------------------------------------------
+def _synth_effects(s):
+    """สังเคราะห์ลิสต์ effects จากพารามิเตอร์สกิลแบบเดิม (สกิล 12 ตัวใน config ไม่มีคีย์ effects)
+    เพื่อให้เอนจิน data-driven ทำงานได้โดยพฤติกรรมเหมือนเดิมเป๊ะ"""
+    eff = []
+    scope = "team" if s.get("target", "self") == "all" else "self"
+    # passive แบบขึ้นกับ target (ตัวเอง/ทั้งทีม)
+    for key in ("atk_mult", "dmg_reduce", "regen"):
+        if key in s:
+            eff.append({"hook": "passive", "type": key, "scope": scope, "value": s[key]})
+    # passive ที่ผลกับตัวเองเสมอ
+    for key in ("crit_add", "rage_mult", "weaken"):
+        if key in s:
+            eff.append({"hook": "passive", "type": key, "scope": "self", "value": s[key]})
+    # on_hit (ดีบัฟ/ตีซ้ำ)
+    if "double" in s:
+        eff.append({"hook": "on_hit", "type": "double", "chance": s["double"]})
+    if "poison" in s:
+        eff.append({"hook": "on_hit", "type": "poison", "dps": s["poison"]})
+    if "freeze_chance" in s:
+        eff.append({"hook": "on_hit", "type": "freeze",
+                    "chance": s["freeze_chance"], "ticks": s.get("freeze", 0)})
+    return eff
+
+
+def skills_json_path():
+    """ที่อยู่ไฟล์นิยามสกิลของผู้ใช้ (assets/skills.json)"""
+    return os.path.join(_assets_dir(), "skills.json")
+
+
+_SKILLS_README = [
+    "ไฟล์นิยามสกิล (เสริม/ทับ config.SKILLS) — แก้ผ่านโปรแกรม manager.py (manage.bat)",
+    "id ซ้ำกับของเดิม = override ฟิลด์นั้น | id ใหม่ = เพิ่มสกิลใหม่",
+    "ฟิลด์: id, emoji, type(attack|buff|debuff), name, desc, aura(red|blue|green), target(self|all)",
+    "pool=true อยู่ในกองสุ่ม | weight=น้ำหนักสุ่ม | rarity_min=ระดับขั้นต่ำที่จะสุ่มออก",
+    "effects: [{hook(on_hit|on_hurt|on_kill|passive), type, ...}]",
+]
+
+
+def load_user_skills():
+    """อ่าน 'เฉพาะ' รายการสกิลที่ผู้ใช้กำหนดใน assets/skills.json (raw ไม่ผสาน config) — คืน list"""
+    import json
+    try:
+        with open(skills_json_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    entries = (data if isinstance(data, list)
+               else data.get("skills", []) if isinstance(data, dict) else [])
+    return [e for e in entries if isinstance(e, dict) and "id" in e]
+
+
+def save_user_skills(entries):
+    """เขียน assets/skills.json (รายการสกิลที่กำหนด/ทับเอง) — คืน True ถ้าสำเร็จ"""
+    import json
+    payload = {"_readme": _SKILLS_README, "skills": list(entries)}
+    try:
+        os.makedirs(_assets_dir(), exist_ok=True)
+        with open(skills_json_path(), "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return True
+    except OSError:
+        return False
+
+
+def load_skills():
+    """คืนลิสต์นิยามสกิลที่ใช้จริง = config.SKILLS (ค่าเริ่มต้น) ผสานทับด้วย assets/skills.json (ถ้ามี)
+    - ผสานแบบ merge by id: id เดิม = override ฟิลด์, id ใหม่ = เพิ่มเข้าไป
+    - ทุกสกิลรับประกันว่ามีคีย์ 'effects' (สังเคราะห์ให้ถ้าไม่มี), 'pool', 'weight'
+    - ไฟล์พัง/อ่านไม่ได้ = คืนค่าเริ่มต้นจาก config เงียบ ๆ (ไม่ทำโปรแกรมล่ม)"""
+    import copy
+    import json
+    skills = [copy.deepcopy(s) for s in config.SKILLS]
+    by_id = {s["id"]: s for s in skills}
+    path = os.path.join(_assets_dir(), "skills.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        entries = (data if isinstance(data, list)
+                   else data.get("skills", []) if isinstance(data, dict) else [])
+        for e in entries:
+            if not isinstance(e, dict) or "id" not in e:
+                continue
+            sid = e["id"]
+            if sid in by_id:
+                by_id[sid].update(e)          # override สกิลเดิม
+            else:
+                skills.append(e)
+                by_id[sid] = e                # เพิ่มสกิลใหม่
+    except (OSError, ValueError):
+        pass
+    for s in skills:
+        if not isinstance(s.get("effects"), list):
+            s["effects"] = _synth_effects(s)
+        s.setdefault("pool", True)
+        s.setdefault("weight", 1.0)
+    return skills
 
 
 def load_asset_sprite(candidates):

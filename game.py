@@ -4,6 +4,7 @@ import base64
 import ctypes
 from ctypes import wintypes
 import datetime
+import math
 import os
 import random
 import subprocess
@@ -14,10 +15,11 @@ from tkinter import messagebox
 
 import config
 import assets
+import market
 import paths
 import save
 import sound
-from entities import Pet, Monster, Food
+from entities import Pet, Monster, Food, Projectile
 
 
 def _sign(n):
@@ -95,6 +97,286 @@ def _enumerate_monitors():
     return rects
 
 
+# ---------------------------------------------------------------------------
+# ทะเบียนเอฟเฟกต์สกิล (data-driven) — handler 1 ตัวต่อ "ชนิดเอฟเฟกต์"
+# เพิ่มสกิลใหม่ที่ใช้ชนิดเดิม = แก้ assets/skills.json อย่างเดียว
+# handler(world, pet, params, ctx): ctx มี target/dmg/atk_mult (on_hit) หรือ monster/dmg (on_hurt)
+# ---------------------------------------------------------------------------
+EFFECTS = {}
+
+
+def _effect(name):
+    def deco(fn):
+        EFFECTS[name] = fn
+        return fn
+    return deco
+
+
+def _roll(p, ctx=None):
+    """โอกาสติดของเอฟเฟกต์ ตาม chance ที่ตั้งไว้ (ไม่ตั้ง = 1.0 = ติดเสมอ)
+    ใช้เหมือนกันทั้งตอนตีปกติ (passive) และตอนปล่อยไม้ตาย (active)"""
+    return random.random() < p.get("chance", 1.0)
+
+
+# กฎรวมค่า passive เมื่อน้องถือหลายสกิล (ค่าที่ไม่ระบุ = เอามากสุด)
+_SELF_AGG = {
+    "atk_mult": "mul", "dmg_reduce": "max", "regen": "sum", "crit_add": "sum",
+    "dodge_add": "sum", "rage_mult": "max", "weaken": "max", "lifesteal": "sum",
+    "atk_speed": "sum", "vigor": "max", "dmg_cap": "min", "second_wind": "sum",
+    "last_stand": "max", "blade_dance": "max", "windfury": "max", "focus": "max",
+    "pierce": "max",
+}
+
+
+@_effect("double")          # 🗡 ดาบคู่: มีโอกาสตีเพิ่มอีกครั้ง
+def _eff_double(world, pet, p, ctx):
+    if _roll(p, ctx):
+        m = ctx["target"]
+        d2 = int(pet.attack() * ctx.get("atk_mult", 1.0))
+        m.hp -= d2
+        world.spawn_effect(m.x + 12, m.top_y() - 8, f"-{d2}")
+
+
+@_effect("poison")          # ☠ พิษ (ดาเมจต่อวินาที ติดมอน)
+def _eff_poison(world, pet, p, ctx):
+    if not _roll(p, ctx):
+        return
+    m = ctx["target"]
+    m.poison_ttl = config.POISON_SECONDS * world._sec_ticks
+    m.poison_dmg = max(m.poison_dmg, p.get("dps", 0))
+
+
+@_effect("freeze")          # ❄ เยือกแข็ง: โอกาสแช่แข็ง (สตันมอน)
+def _eff_freeze(world, pet, p, ctx):
+    if _roll(p, ctx):
+        m = ctx["target"]
+        m.stun_ttl = max(m.stun_ttl, int(p.get("ticks", 0)))
+        world.spawn_status_text(m, "❄", config.STATUS_COLORS["ice"])
+
+
+@_effect("execute")         # 🪓 ปลิดชีพ: มอนเลือดต่ำ → ดาเมจเพิ่ม
+def _eff_execute(world, pet, p, ctx):
+    m = ctx["target"]
+    if m.hp > 0 and m.hp_ratio() < p.get("below", 0.30):
+        bonus = int(ctx.get("dmg", 0) * p.get("mult", 0.5))
+        if bonus > 0:
+            m.hp -= bonus
+            world.spawn_effect(m.x, m.top_y() - 10, f"☠-{bonus}")
+
+
+@_effect("bleed")           # 🩸 เลือดไหล: DoT เป็น % ของเลือดสูงสุดมอน
+def _eff_bleed(world, pet, p, ctx):
+    if not _roll(p, ctx):
+        return
+    m = ctx["target"]
+    dmg = max(1, int(m.max_hp * p.get("pct", 0.02)))
+    m.bleed_ttl = int(p.get("secs", 5)) * world._sec_ticks
+    m.bleed_dmg = max(m.bleed_dmg, dmg)
+
+
+@_effect("cleave")          # ⚔ กวาดล้าง: กระจายดาเมจใส่มอนตัวอื่นรอบ ๆ (ต้องมีมอนหลายตัว)
+def _eff_cleave(world, pet, p, ctx):
+    m = ctx["target"]
+    splash = max(1, int(ctx.get("dmg", 0) * p.get("pct", 0.30)))
+    others = sorted((x for x in world.monsters if x is not m and x.hp > 0),
+                    key=lambda x: abs(x.x - m.x))
+    for x in others[:int(p.get("max_targets", 99))]:
+        x.hp -= splash
+        world.spawn_effect(x.x, x.top_y(), f"-{splash}")
+
+
+@_effect("chain")           # ⚡ ชาร์จสายฟ้า: ชิ่งใส่มอนใกล้สุดอีกตัว
+def _eff_chain(world, pet, p, ctx):
+    m = ctx["target"]
+    others = [x for x in world.monsters if x is not m and x.hp > 0]
+    if not others:
+        return
+    x = min(others, key=lambda o: abs(o.x - m.x))
+    d = max(1, int(ctx.get("dmg", 0) * p.get("pct", 0.5)))
+    x.hp -= d
+    world.spawn_effect(x.x, x.top_y(), f"⚡-{d}")
+
+
+@_effect("giant_killer")    # 🪜 ล่ายักษ์: ตีบอส/ตัวที่เลือดเยอะกว่าแรงขึ้น
+def _eff_giant_killer(world, pet, p, ctx):
+    m = ctx["target"]
+    if m.hp > 0 and (m.is_boss or m.max_hp > pet.max_hp()):
+        bonus = int(ctx.get("dmg", 0) * p.get("mult", 0.25))
+        if bonus > 0:
+            m.hp -= bonus
+            world.spawn_effect(m.x, m.top_y() - 10, f"-{bonus}")
+
+
+@_effect("lone_wolf")       # 🐺 หมาป่าเดียวดาย: ไม่มีเพื่อนใกล้ ๆ → ดาเมจเพิ่ม
+def _eff_lone_wolf(world, pet, p, ctx):
+    near = sum(1 for q in world.pets
+               if q is not pet and q.behavior == "fight"
+               and abs(q.x - pet.x) <= config.SOCIAL_RANGE)
+    if near == 0:
+        m = ctx["target"]
+        bonus = int(ctx.get("dmg", 0) * p.get("mult", 0.30))
+        if m.hp > 0 and bonus > 0:
+            m.hp -= bonus
+            world.spawn_effect(m.x, m.top_y() - 10, f"-{bonus}")
+
+
+@_effect("slow")            # 🕸 ลดความเร็ว: มอนเดิน/ตีช้าลง
+def _eff_slow(world, pet, p, ctx):
+    if _roll(p, ctx):
+        m = ctx["target"]
+        m.slow_ttl = int(p.get("secs", 4)) * world._sec_ticks
+        m.slow_pct = max(m.slow_pct, p.get("pct", 0.4))
+        world.spawn_status_text(m, "🕸", config.STATUS_COLORS["ice"])
+
+
+@_effect("vulnerable")      # 💢 คำสาป/เปราะ: มอนรับดาเมจเพิ่ม
+def _eff_vulnerable(world, pet, p, ctx):
+    if not _roll(p, ctx):
+        return
+    m = ctx["target"]
+    m.vuln_ttl = int(p.get("secs", 5)) * world._sec_ticks
+    m.vuln_pct = max(m.vuln_pct, p.get("pct", 0.15))
+
+
+@_effect("stun")            # 💫 สลบ/หลับ/สาปหิน: โอกาสทำให้มอนนิ่ง (ใช้ stun_ttl ร่วมกับแช่แข็ง)
+def _eff_stun(world, pet, p, ctx):
+    if _roll(p, ctx):
+        m = ctx["target"]
+        m.stun_ttl = max(m.stun_ttl, int(p.get("ticks", 45)))
+        world.spawn_status_text(m, "💫", config.STATUS_COLORS["ice"])
+
+
+@_effect("blind")           # 🌑 ตาบอด: มอนมีโอกาสตีพลาด
+def _eff_blind(world, pet, p, ctx):
+    if _roll(p, ctx):
+        m = ctx["target"]
+        m.blind_ttl = int(p.get("secs", 4)) * world._sec_ticks
+        m.blind_miss = max(m.blind_miss, p.get("miss", 0.5))
+
+
+@_effect("knockback")       # 🌊 คลื่นกระแทก: ผลักมอนถอยหลัง
+def _eff_knockback(world, pet, p, ctx):
+    if _roll(p, ctx):
+        m = ctx["target"]
+        m.x += (1 if m.x >= pet.x else -1) * p.get("dist", 60)
+
+
+@_effect("armor_break")     # ⛏ ทำลายเกราะ: ลดเกราะมอนถาวร (ระหว่างสู้) สะสมได้
+def _eff_armor_break(world, pet, p, ctx):
+    if not _roll(p, ctx):
+        return
+    m = ctx["target"]
+    m.armor_shred = min(m.armor, m.armor_shred + p.get("amount", 0.05))
+
+
+@_effect("doom")            # ☠ คำสาปสั่งตาย/ระเบิดเวลา: นับถอยหลังแล้วระเบิดดาเมจหนัก
+def _eff_doom(world, pet, p, ctx):
+    if not _roll(p, ctx):
+        return
+    m = ctx["target"]
+    if m.doom_ttl <= 0:                              # ติดได้ทีละครั้ง (จนกว่าจะระเบิด)
+        m.doom_ttl = int(p.get("secs", 8)) * world._sec_ticks
+        m.doom_dmg = int(pet.attack() * p.get("mult", 3.0))
+        world.spawn_status_text(m, "☠", config.STATUS_COLORS["poison"])
+
+
+@_effect("plague")          # 🦠 โรคระบาด: ติดพิษ + ตายแล้วแพร่ใส่มอนข้าง ๆ
+def _eff_plague(world, pet, p, ctx):
+    if not _roll(p, ctx):
+        return
+    m = ctx["target"]
+    m.poison_ttl = config.POISON_SECONDS * world._sec_ticks
+    m.poison_dmg = max(m.poison_dmg, p.get("dps", 8))
+    m.plague = True
+
+
+@_effect("poison_stack")    # 🧪 พิษสะสม: ตีซ้ำเพิ่มดาเมจพิษ (มีเพดาน)
+def _eff_poison_stack(world, pet, p, ctx):
+    if not _roll(p, ctx):
+        return
+    m = ctx["target"]
+    m.poison_ttl = int(p.get("secs", 5)) * world._sec_ticks
+    m.poison_dmg = min(int(p.get("cap", 60)), m.poison_dmg + p.get("dps", 5))
+
+
+@_effect("thorns")          # 🌵 หนามสะท้อน: สะท้อนดาเมจกลับมอนที่ตี (hook=on_hurt)
+def _eff_thorns(world, pet, p, ctx):
+    m = ctx.get("monster")
+    if m is None:
+        return
+    r = max(1, int(ctx.get("dmg", 0) * p.get("pct", 0.15)))
+    m.hp -= r
+    world.spawn_effect(m.x, m.top_y(), f"-{r}")
+
+
+@_effect("fatality")        # 💀 ปิดฉาก: ฆ่ามอน → คืนเกจท่าไม้ตาย (hook=on_kill)
+def _eff_fatality(world, pet, p, ctx):
+    pet.rage = min(config.RAGE_MAX, pet.rage + config.RAGE_MAX * p.get("value", 0.2))
+
+
+@_effect("shield")          # 🛡 บาเรีย: สร้างโล่ดูดดาเมจ = % ของเลือดสูงสุด (hook=active)
+def _eff_shield(world, pet, p, ctx):
+    amt = max(1, int(pet.max_hp() * p.get("pct", 0.2)))
+    pet.shield = max(pet.shield, amt)
+    world.spawn_status_text(pet, "🛡", config.STATUS_COLORS["ice"])
+
+
+@_effect("invuln")          # ✨ พรคุ้มครอง/ไร้ตัวตน: อมตะชั่วคราว (hook=active)
+def _eff_invuln(world, pet, p, ctx):
+    pet.invuln_ttl = max(pet.invuln_ttl, int(p.get("secs", 2)) * world._sec_ticks)
+    world.spawn_status_text(pet, "✨", config.STATUS_COLORS["heal"])
+
+
+@_effect("heal_burst")      # 💉 ปฐมพยาบาล: ฮีลก้อนใหญ่ (ตัวเอง/เพื่อนเลือดน้อยสุด หรือทั้งทีม) (hook=active)
+def _eff_heal_burst(world, pet, p, ctx):
+    fl = ctx.get("fighters") or [pet]
+    targets = fl if p.get("team") else [min(fl, key=lambda q: q.alive_ratio())]
+    pct = p.get("pct", 0.25)
+    for q in targets:
+        if q.hp < q.max_hp():
+            heal = max(1, int(q.max_hp() * pct))
+            q.hp = min(q.max_hp(), q.hp + heal)
+            world.spawn_status_text(q, f"+{heal}", config.STATUS_COLORS["heal"])
+
+
+@_effect("resurrect")       # 🌟 ชุบชีวิต: ปลุกเพื่อนที่สลบ 1 ตัว (hook=active, cd นาน)
+def _eff_resurrect(world, pet, p, ctx):
+    dead = [q for q in world.pets if q.behavior == "dead"]
+    if not dead:
+        return
+    q = dead[0]
+    world._reset_combat_state(q)
+    q.hp = max(1, int(q.max_hp() * p.get("pct", 0.3)))
+    q.behavior = "fight"
+    world.show_bubble("ชุบชีวิต! 🌟", q)
+    world.spawn_status_text(q, "🌟", config.STATUS_COLORS["heal"])
+
+
+@_effect("purify")          # 🧼 ชำระล้าง: ลบไฟไหม้ออกจากทั้งทีม (hook=active)
+def _eff_purify(world, pet, p, ctx):
+    for q in (ctx.get("fighters") or [pet]):
+        if q.burn_ttl > 0:
+            q.burn_ttl = 0
+            world.spawn_status_text(q, "🧼", config.STATUS_COLORS["heal"])
+
+
+@_effect("energize")        # ⚡ เติมพลัง: เติมเกจท่าไม้ตายให้เพื่อนที่เกจน้อยสุด (hook=active)
+def _eff_energize(world, pet, p, ctx):
+    fl = ctx.get("fighters") or [pet]
+    q = min(fl, key=lambda x: x.rage)
+    q.rage = min(config.RAGE_MAX, q.rage + config.RAGE_MAX * p.get("value", 0.3))
+    world.spawn_status_text(q, "⚡", config.STATUS_COLORS["heal"])
+
+
+def _eff_noop(world, pet, p, ctx):
+    """เอฟเฟกต์ที่ยังไม่รองรับ (ต้องมีระบบเพิ่ม) — ไม่ทำอะไร กัน json อ้างถึงแล้ว crash"""
+
+
+# ชนิดที่ยังไม่รองรับ (รอระบบ: แท็งก์-อักโกร/มอนสู้กันเอง ฯลฯ)
+for _deferred in ("taunt", "decoy", "silence", "confuse", "blackhole"):
+    EFFECTS.setdefault(_deferred, _eff_noop)
+
+
 class World:
     def __init__(self):
         _enable_dpi_awareness()
@@ -132,10 +414,21 @@ class World:
         fa = assets.load_sprite(config.FOOD_SPRITES) or assets.build_fallback("food", config.FOOD_SIZE)
         self.food_anims = {"idle": fa}
 
+        # ระบบสกิล (data-driven) — โหลดก่อนสร้างน้อง เพราะ _build_pet ใช้สุ่ม/ตรวจสกิล
+        self._init_skills()
+
         # สร้างน้องทั้งหมดจากเซฟ (รองรับหลายตัว + ย้ายข้อมูลเซฟเก่ามาเป็นตัวแรก)
         self.pets = []
         self.active = 0
-        self.monster = None
+        self.game_time = 0.0       # เวลาในเกม (นาที) — โหลดจริงใน _load_progress
+        # ตลาดซื้อขายไข่ — ใช้ backend จำลองในเครื่องก่อน (สลับเป็น API ภายหลังได้)
+        self.market = market.LocalMarketBackend()
+        self.monsters = []
+        self.projectiles = []      # ลูกกระสุนของน้อง ranged ที่กำลังพุ่ง
+        # มอนหลายตัว/รอบ: นับมอนที่เกิดแล้ว + ฆ่าแล้วในรอบนี้ (ตัวนับเฟรมสำหรับมอนเสริม)
+        self.wave_spawned = 0
+        self.wave_killed = 0
+        self._reinforce_in = 0
         self._load_progress()
         # นับถอยหลัง (วินาที) จนกว่ามอนสเตอร์ตัวถัดไปจะสุ่มเกิดเอง
         self.monster_spawn_in = random.randint(config.MONSTER_SPAWN_MIN_SEC,
@@ -209,9 +502,20 @@ class World:
     def character(self):
         return self.pet.character
 
+    @property
+    def monster(self):
+        """มอนสเตอร์ตัวแรก (เผื่อโค้ดเก่าที่เช็กแค่ 'กำลังสู้อยู่ไหม') — None ถ้าไม่มีมอน"""
+        return self.monsters[0] if self.monsters else None
+
+    def _game_clock(self):
+        """คืน (วันที่, ชั่วโมง, นาที) ของเวลาในเกม (เดินตามการเล่น ไม่อิงเวลาจริง)"""
+        tod = self.game_time % config.GAME_MINUTES_PER_DAY      # นาทีในวันนี้
+        day = int(self.game_time // config.GAME_MINUTES_PER_DAY) + 1
+        return day, int(tod // 60), int(tod % 60)
+
     def _is_night(self):
-        """กลางคืนไหม (ตามเวลาจริงของเครื่อง)"""
-        h = datetime.datetime.now().hour
+        """กลางคืนไหม (อิงชั่วโมงของเวลาในเกม)"""
+        h = self._game_clock()[1]
         s, e = config.NIGHT_START_HOUR, config.NIGHT_END_HOUR
         return (h >= s or h < e) if s > e else (s <= h < e)
 
@@ -230,16 +534,22 @@ class World:
         """โหลดชุดสไปรต์มอนสเตอร์ทุกแบบ: ตัวเริ่มต้น (assets/) + ทุกโฟลเดอร์ใน monsters/
         แต่ละชุดมี walk/hurt (+idle สำรอง) — ตอนเกิดจะสุ่มเลือกชุดหนึ่ง"""
         folder_cand = {
+            "idle": ["idle.gif", "idle.png"],
             "walk": ["walk.gif", "walk.png", "monster_walk.gif", "monster_walk.png",
                      "monster.gif", "monster.png"],
+            "attack": ["attack.gif", "attack.png"],
             "hurt": ["hurt.gif", "hurt.png", "monster_hurt.gif", "monster_hurt.png"],
+            "cc":   ["cc.gif", "cc.png"],          # ติดสตัน/แช่แข็ง/หลับ
+            "dead": ["dead.gif", "dead.png"],
         }
         sets = []
         assets.set_character_dir(None)               # ตัวเริ่มต้นจาก assets/
-        sets.append(self._load_anims(config.MONSTER_SPRITES, "monster", config.MONSTER_SIZE))
+        sets.append({"anims": self._load_anims(config.MONSTER_SPRITES, "monster",
+                                               config.MONSTER_SIZE), "meta": {}})
         for name in assets.list_monsters():          # มอนที่ผู้ใช้เพิ่ม (โฟลเดอร์ละตัว)
             assets.set_character_dir(assets.monster_path(name))
-            sets.append(self._load_anims(folder_cand, "monster", config.MONSTER_SIZE))
+            sets.append({"anims": self._load_anims(folder_cand, "monster", config.MONSTER_SIZE),
+                         "meta": assets.load_monster_meta(name)})
         assets.set_character_dir(None)
         return sets
 
@@ -291,6 +601,9 @@ class World:
         x = float(pd.get("x", self.sw * (0.3 + 0.12 * len(self.pets))))
         pet = Pet(self.canvas, anims, x, 0)
         pet.character = character
+        # ประเภทการตีปกติ: ใช้ค่าที่เซฟไว้ ไม่งั้นเอาจาก pet.json ของตัวละคร (default ประชิด)
+        rt = pd.get("range_type") or meta.get("range_type") or "melee"
+        pet.range_type = "ranged" if rt == "ranged" else "melee"
         # ความชอบอาหาร: ใช้ค่าที่ส่งมา (สืบทอดจากพ่อแม่/ไข่) ถ้ามี ไม่งั้นเอาจาก pet.json
         likes_src = pd["likes"] if isinstance(pd.get("likes"), list) else meta.get("likes", [])
         dislikes_src = (pd["dislikes"] if isinstance(pd.get("dislikes"), list)
@@ -329,9 +642,14 @@ class World:
         # เพศ (สุ่มถ้ายังไม่มี) + สกิลติดตัว (สุ่ม 1 อย่างถ้ายังไม่มี)
         pet.gender = (pd["gender"] if pd.get("gender") in {"m", "f"}
                       else random.choice(config.GENDERS)["id"])
-        valid_skills = {s["id"] for s in config.SKILLS}
-        pet.skill = (pd["skill"] if pd.get("skill") in valid_skills
-                     else random.choice(config.SKILLS)["id"])
+        # สกิลติดตัว (หลายสกิลได้): ใช้ "skills" (list) ถ้ามี ไม่งั้น "skill" เดี่ยว (เซฟเก่า) ไม่งั้นสุ่ม 1
+        sk = pd.get("skills")
+        if not isinstance(sk, list):
+            sk = [pd["skill"]] if pd.get("skill") else []
+        sk = [s for s in dict.fromkeys(sk) if s in self.skills_by_id]  # กรองซ้ำ/ไม่รู้จัก
+        if not sk:
+            sk = [self._random_skill(character, meta, pd.get("rarity"))]
+        pet.skills = sk[:config.PET_MAX_SKILLS]
         valid_rar = {r["id"] for r in config.RARITIES}
         pet.rarity = pd["rarity"] if pd.get("rarity") in valid_rar else "common"
         try:
@@ -367,10 +685,11 @@ class World:
             "tricks_taught": pet.tricks_taught,
             "likes": list(pet.likes), "dislikes": list(pet.dislikes),
             "trait": pet.trait, "train": dict(pet.train),
-            "gender": pet.gender, "skill": pet.skill, "rarity": pet.rarity,
+            "gender": pet.gender, "skills": list(pet.skills), "rarity": pet.rarity,
             "sp": pet.sp, "build": dict(pet.build), "rebirths": pet.rebirths,
             "away_until": round(pet.away_until, 1), "away_mins": pet.away_mins,
             "birth_date": pet.birth_date, "x": round(pet.x, 1),
+            "range_type": pet.range_type,
         }
 
     def _work_bottom_at(self, x):
@@ -656,21 +975,54 @@ class World:
             pet.eat_timer = 40
             pet.set_state("eat")
 
+    def _can_fight_now(self):
+        """มีน้องอย่างน้อย 1 ตัวพร้อมสู้ไหม (ไม่สลบ/ไม่ถูกลาก/ไม่ผจญภัย)"""
+        return any(p.behavior not in ("dead", "drag") and not self._is_away(p)
+                   for p in self.pets)
+
     def _tick_spawn_monster(self):
-        """นับถอยหลังเพื่อให้มอนสเตอร์สุ่มเกิดเอง (เรียกทุก ~1 วินาที)"""
+        """คุมการเกิดมอนแบบหลายตัว/รอบ (เรียกทุก ~1 วินาที สำหรับมอน "ตัวแรก" ของรอบ)
+        - ต่อรอบมี WAVE_LENGTH ตัว ตัวสุดท้าย = บอส (มาเดี่ยวเสมอ)
+        - มอนปกติเกิดพร้อมกันได้สูงสุด min(wave_round, WAVE_CONCURRENT_CAP) ตัว
+        มอน "เสริม" ระหว่างรอบเกิดเร็ว (คุมด้วย _reinforce_in ใน _tick) ไม่ใช่ตัวจับเวลานี้"""
         if not getattr(self, "combat_enabled", True):
             return                              # โหมดเลี้ยงอย่างเดียว: ไม่เกิดมอน
-        if self.monster is not None:
+        if not self._can_fight_now():
             return
-        # เกิดได้ถ้ามีน้องอย่างน้อย 1 ตัวพร้อมสู้ (ไม่สลบ/ไม่ถูกลาก/ไม่ผจญภัย)
-        if not any(p.behavior not in ("dead", "drag") and not self._is_away(p)
-                   for p in self.pets):
+        normals = config.WAVE_LENGTH - 1
+        boss_phase = self.wave_spawned >= normals and self.wave_killed >= normals
+        if boss_phase:
+            if not self.monsters:               # adds ตายหมดแล้ว → บอสมาเดี่ยว
+                self._spawn_one(is_boss=True)
+            return
+        cap = min(self.wave_round, config.WAVE_CONCURRENT_CAP)
+        if len(self.monsters) >= cap or self.wave_spawned >= normals:
+            return                              # จอเต็ม หรือ adds รอบนี้เกิดครบแล้ว
+        # ตัวแรกของรอบ = ใช้ตัวจับเวลาวินาทีปกติ; ตัวถัดไป (เสริม) คุมใน _tick
+        if self.monsters:
             return
         self.monster_spawn_in -= 1
         if self.monster_spawn_in <= 0:
-            self._spawn_monster()
+            self._spawn_one(is_boss=False)
             self.monster_spawn_in = random.randint(config.MONSTER_SPAWN_MIN_SEC,
                                                    config.MONSTER_SPAWN_MAX_SEC)
+
+    def _tick_reinforce(self):
+        """เกิดมอน "เสริม" เร็ว ๆ จนเต็ม cap ของรอบ (เรียกทุกเฟรมใน _tick)"""
+        if not getattr(self, "combat_enabled", True) or not self.monsters:
+            return                              # ไม่มีมอนอยู่เลย = ปล่อยให้ตัวจับเวลาวินาทีจัดการ
+        if not self._can_fight_now():
+            return
+        normals = config.WAVE_LENGTH - 1
+        if self.wave_spawned >= normals:        # adds รอบนี้ครบแล้ว (รอเคลียร์ก่อนบอส)
+            return
+        cap = min(self.wave_round, config.WAVE_CONCURRENT_CAP)
+        if len(self.monsters) >= cap:
+            return
+        self._reinforce_in -= 1
+        if self._reinforce_in <= 0:
+            self._spawn_one(is_boss=False)
+            self._reinforce_in = config.WAVE_REINFORCE_TICKS
 
     def _scaled_anims(self, anims, factor):
         """คืนชุดอนิเมชันที่ขยายขนาด factor เท่า (จำนวนเต็ม) — ใช้ทำบอสตัวใหญ่"""
@@ -682,12 +1034,128 @@ class World:
             out[state] = assets.Animation([f.zoom(factor) for f in anim.frames])
         return out
 
-    def _spawn_monster(self):
-        """สร้างมอนตัวถัดไปของเวฟ — HP/ATK สเกลตามเลเวลเพ็ท + เวฟ; ตัวที่ WAVE_LENGTH = บอส"""
-        is_boss = self.wave_step >= config.WAVE_LENGTH
-        # สุ่มเลือกมอนสเตอร์ 1 แบบจากชุดที่มี (บอสตัวใหญ่กว่า)
-        base = random.choice(self.monster_sets) if self.monster_sets else \
-            self._load_anims(config.MONSTER_SPRITES, "monster", config.MONSTER_SIZE)
+    def _mon_self(self, m, key, default=0):
+        """อ่านค่าสกิล passive (มุมมองมอน) ของมอนตัวนี้"""
+        s = self._skill_def(m.skill)
+        return s["_self"].get(key, default) if s else default
+
+    def _monster_has_active(self, m):
+        """มอนมีสกิลใช้งาน (active) ไหม → มีเกจไม้ตาย"""
+        return self._skill_active(self._skill_def(m.skill))
+
+    def _apply_monster_skill_spawn(self, m):
+        """สกิลมอน: บัฟตัวเองตอนเกิด — โจมตีแรงขึ้น / มีเกราะ"""
+        s = self._skill_def(m.skill)
+        if not s:
+            return
+        sd = s["_self"]
+        if sd.get("atk_mult"):
+            m.atk = max(1, int(m.atk * sd["atk_mult"]))
+        if sd.get("dmg_reduce"):
+            m.armor = max(m.armor, sd["dmg_reduce"])
+
+    def _monster_active(self, m, s, fighters=None):
+        """ปล่อยสกิลใช้งานของมอน (ตอนเกจไม้ตายเต็ม): บัฟตัวเอง + ปล่อยดีบัฟใส่น้อง"""
+        for e in s["_hooks"].get("active", ()):       # โล่/อมตะ/ฮีลตัวเอง
+            t = e["type"]
+            if t == "shield":
+                m.shield = max(m.shield, int(m.max_hp * e.get("pct", 0.2)))
+                self.spawn_status_text(m, "🛡", config.STATUS_COLORS["ice"])
+            elif t == "invuln":
+                m.invuln_ttl = max(m.invuln_ttl, int(e.get("secs", 2)) * self._sec_ticks)
+                self.spawn_status_text(m, "✨", config.STATUS_COLORS["heal"])
+            elif t == "heal_burst" and m.hp < m.max_hp:
+                heal = max(1, int(m.max_hp * e.get("pct", 0.25)))
+                m.hp = min(m.max_hp, m.hp + heal)
+                self.spawn_status_text(m, f"+{heal}", config.STATUS_COLORS["heal"])
+        # ดีบัฟ on_hit → ปล่อยใส่น้องใกล้สุด + ดาเมจไม้ตาย (ตามโอกาสติดที่ตั้งไว้)
+        if s["_hooks"].get("on_hit") and fighters:
+            tgt = min(fighters, key=lambda p: abs(p.x - m.x))
+            dmg = self._monster_on_hit_pet(m, tgt, int(m.atk * 2))
+            if dmg > 0:
+                tgt.hp -= dmg
+                self.spawn_effect(tgt.x, tgt.top_y(), f"⚡-{dmg}")
+
+    def _monster_strike(self, m, tgt, team):
+        """มอน 1 ตัวตีน้อง 1 ครั้ง (ใช้ทั้งประชิดและตอนลูกยิงไปโดน) — รวมหลบ/เกราะ/คริ/ดูดเลือด/สกิล"""
+        if tgt is None or tgt.behavior == "dead":
+            return
+        dodge = tgt.dodge_chance() + self._self_val(tgt, "dodge_add", 0.0)
+        if m.blind_ttl > 0 and random.random() < m.blind_miss:
+            self.spawn_effect(tgt.x, tgt.top_y(), "MISS")
+            return
+        if random.random() * 100 < dodge:
+            self.spawn_effect(tgt.x, tgt.top_y(), "หลบ✨")
+            return
+        if tgt.invuln_ttl > 0:
+            self.spawn_effect(tgt.x, tgt.top_y(), "อมตะ✨")
+            return
+        reduce = max(self._self_val(tgt, "dmg_reduce", 0.0), team.get("dmg_reduce", 0.0))
+        vigor = self._self_val(tgt, "vigor", 0.0)
+        if vigor:
+            reduce += vigor * (1.0 - tgt.alive_ratio())
+        dmg = int(m.atk * (1.0 - min(0.9, reduce)))
+        if random.random() * 100 < self._mon_self(m, "crit_add", 0):
+            dmg = int(dmg * config.CRIT_MULT)
+        if not self._monster_has_active(m):          # ดีบัฟติดทุกหมัด "เฉพาะมอนสกิลพาสซีฟ"
+            dmg = self._monster_on_hit_pet(m, tgt, dmg)
+        cap = self._self_val(tgt, "dmg_cap", 0.0)
+        if cap:
+            dmg = min(dmg, max(1, int(tgt.max_hp() * cap)))
+        dmg = max(1, dmg)
+        if tgt.shield > 0:
+            absorbed = min(tgt.shield, dmg)
+            tgt.shield -= absorbed
+            dmg -= absorbed
+        if dmg > 0:
+            tgt.hp -= dmg
+            self.spawn_effect(tgt.x, tgt.top_y(), f"-{dmg}")
+            mls = self._mon_self(m, "lifesteal", 0)
+            if mls and m.hp < m.max_hp:
+                m.hp = min(m.max_hp, m.hp + max(1, int(dmg * mls / 100.0)))
+        else:
+            self.spawn_effect(tgt.x, tgt.top_y(), "🛡")
+        tgt.set_state("hurt")
+        tgt.happy = max(0, tgt.happy - 3)
+        tgt.rage = min(config.RAGE_MAX,
+                       tgt.rage + config.RAGE_ON_HURT * self._skill_val(tgt, "rage_mult", 1.0))
+        sound.play("hurt")
+        self._run_hook("on_hurt", tgt, monster=m, dmg=dmg)   # 🌵 หนามสะท้อนของน้อง
+        if m.is_boss and tgt.burn_ttl <= 0 and random.random() < config.BURN_CHANCE_BOSS:
+            tgt.burn_ttl = config.BURN_SECONDS * self._sec_ticks
+            self.spawn_status_text(tgt, "🔥", config.STATUS_COLORS["fire"])
+        if self._monster_has_active(m):              # มอนสะสมเกจไม้ตายเมื่อตีโดน
+            m.rage = min(config.RAGE_MAX, m.rage + config.RAGE_ON_HIT)
+
+    def _monster_on_hit_pet(self, m, tgt, dmg):
+        """สกิลมอน on_hit: ใส่ดีบัฟ/ดาเมจเสริมใส่น้องตอนมอนตีโดน (ที่มีความหมายเท่านั้น)"""
+        s = self._skill_def(m.skill)
+        if not s:
+            return dmg
+        for e in s["_hooks"].get("on_hit", ()):
+            t = e["type"]
+            if t in ("poison", "bleed", "plague", "burn", "ignite", "toxin"):  # DoT → ไฟไหม้ใส่น้อง
+                if tgt.burn_ttl <= 0 and _roll(e):       # ตามโอกาสติด (chance) ที่ตั้งไว้
+                    tgt.burn_ttl = config.BURN_SECONDS * self._sec_ticks
+                    self.spawn_status_text(tgt, "🔥", config.STATUS_COLORS["fire"])
+            elif t == "execute" and tgt.alive_ratio() < e.get("below", 0.3):
+                dmg = int(dmg * (1.0 + e.get("mult", 0.5)))
+            elif t == "knockback" and _roll(e):
+                tgt.x = max(40.0, min(self.sw - 40.0,
+                                      tgt.x + (1 if tgt.x >= m.x else -1) * e.get("dist", 60)))
+        return dmg
+
+    def _spawn_one(self, is_boss=False):
+        """สร้างมอน 1 ตัว เพิ่มเข้า self.monsters — HP/ATK สเกลตามเลเวลเพ็ท + เวฟ
+        (มอนปกติ 1 ตัวนับเป็น wave_spawned +1; บอสมาเดี่ยว ไม่นับเข้า adds)"""
+        # สุ่มเลือกมอนสเตอร์ 1 แบบจากชุดที่มี (แต่ละชุดมี anims + meta: rarity/range_type/skill)
+        if self.monster_sets:
+            chosen = random.choice(self.monster_sets)
+        else:
+            chosen = {"anims": self._load_anims(config.MONSTER_SPRITES, "monster",
+                                                config.MONSTER_SIZE), "meta": {}}
+        base = chosen["anims"]
+        meta = chosen.get("meta") or {}
         base_w = (base.get("walk") or base.get("idle")).w
         if is_boss:
             anims = self._scaled_anims(base, config.BOSS_SIZE_MULT)
@@ -696,14 +1164,23 @@ class World:
             anims = base
             width = base_w
 
-        from_left = random.random() < 0.5
-        x = -width if from_left else self.sw + width
+        # เกิดจากซ้าย/ขวา + เหลื่อมตามจำนวนมอนที่อยู่บนจอ (กันซ้อนทับกันสนิท)
+        from_left = len(self.monsters) % 2 == 0
+        stagger = len(self.monsters) * 46
+        x = (-width - stagger) if from_left else (self.sw + width + stagger)
         m = Monster(self.canvas, anims, x, 0)
         m.is_boss = is_boss
 
-        # สเตตัสฐาน: ตามเลเวลเพ็ท แล้วคูณโบนัสเวฟ (เก่งขึ้นทุกเวฟ)
+        # ระดับ/ประเภทการตี/สกิล (จาก monster.json)
+        valid_rar = {r["id"] for r in config.RARITIES}
+        m.rarity = meta.get("rarity") if meta.get("rarity") in valid_rar else "common"
+        m.range_type = "ranged" if meta.get("range_type") == "ranged" else "melee"
+        m.skill = meta.get("skill") if meta.get("skill") in self.skills_by_id else ""
+        rar_mult = config.rarity_by_id(m.rarity).get("stat_mult", 1.0)
+
+        # สเตตัสฐาน: ตามเลเวลเพ็ท แล้วคูณโบนัสเวฟ (เก่งขึ้นทุกเวฟ) × ระดับความหายาก
         lvl = self.pet.level
-        round_mult = 1 + (self.wave_round - 1) * config.WAVE_STRENGTH_BONUS
+        round_mult = (1 + (self.wave_round - 1) * config.WAVE_STRENGTH_BONUS) * rar_mult
         base_hp = (config.MONSTER_MAX_HP + (lvl - 1) * config.MONSTER_HP_PER_LEVEL) * round_mult
         base_atk = (config.MONSTER_ATTACK + (lvl - 1) * config.MONSTER_ATTACK_PER_LEVEL) * round_mult
         if is_boss:
@@ -716,8 +1193,13 @@ class World:
             m.max_hp = max(1, int(round(base_hp * random.uniform(1 - v, 1 + v))))
             m.atk = max(1, int(round(base_atk * random.uniform(1 - v, 1 + v))))
         m.hp = m.max_hp
+        if is_boss:
+            m.armor = config.BOSS_ARMOR        # บอสมีเกราะ (สกิลเจาะ/ทำลายเกราะมีผล)
+        self._apply_monster_skill_spawn(m)     # สกิลมอน: บัฟตัวเองตอนเกิด (โจมตี/เกราะ)
 
-        self.monster = m
+        self.monsters.append(m)
+        if not is_boss:
+            self.wave_spawned += 1
         self._drop_to_ground(m)
         m.sync_position()
         # น้องทุกตัวที่พร้อม (ไม่สลบ/ไม่ถูกลาก/ไม่ผจญภัย) วิ่งเข้าไปรุมสู้
@@ -729,15 +1211,17 @@ class World:
                 p.food.destroy()
                 p.food = None
             p.eat_timer = None
+            if p.behavior != "fight":            # เพิ่งเข้าสู้ → รีเซ็ตสถานะป้องกัน
+                self._reset_combat_state(p)
             p.behavior = "fight"
             weaken = max(weaken, self._skill_val(p, "weaken"))   # 💢 ทอนกำลัง
-        if weaken:
+        if weaken:                               # ทอนกำลัง: ใช้กับมอนที่เพิ่งเกิดตัวนี้
             m.atk = max(1, int(m.atk * (1.0 - weaken)))
         if is_boss:
             self.show_bubble(f"👑 บอสเวฟ {self.wave_round} มาแล้ว!")
             sound.play("boss")
         else:
-            self.show_bubble(f"⚔ มอนสเตอร์ ({self.wave_step}/{config.WAVE_LENGTH})")
+            self.show_bubble(f"⚔ มอนสเตอร์ ({self.wave_killed + 1}/{config.WAVE_LENGTH})")
 
     def toggle_stand(self):
         """สลับโหมด 'ยืนเฉย ๆ' (ไม่เดิน แต่หันซ้าย-ขวา) กับเดินเล่นปกติ"""
@@ -770,10 +1254,10 @@ class World:
                                      outline="#5a7fa5", width=2,
                                      tags=("hudedge", "btn_hud_edge"))
         self.canvas.create_text((hx0 + hx1) / 2, (hy0 + hy1) / 2, text="☰",
-                                fill="#ffffff", font=("Segoe UI", 18, "bold"),
+                                fill="#ffffff", font=("Segoe UI", 13, "bold"),
                                 tags=("hudedge", "btn_hud_edge"))
         if alert:                                   # จุดแดงเตือนว่ามีอะไรรอทำ
-            r = 6
+            r = 5
             self.canvas.create_oval(hx1 - r - 3, hy0 + 3, hx1 - 3, hy0 + 3 + r,
                                     fill="#e74c3c", outline="#ffffff", width=1,
                                     tags=("hudedge", "btn_hud_edge"))
@@ -936,41 +1420,142 @@ class World:
     def _trait_of(pet):
         return next((t for t in config.TRAITS if t["id"] == pet.trait), None)
 
-    @staticmethod
-    def _skill_of(pet):
-        return config.skill_by_id(pet.skill)
+    def _skill_of(self, pet):
+        defs = self._pet_skill_defs(pet)
+        return defs[0] if defs else None
 
     @staticmethod
     def _gender_of(pet):
         return next((g for g in config.GENDERS if g["id"] == pet.gender),
                     config.GENDERS[0])
 
-    @staticmethod
-    def _skill_val(pet, key, default=0):
-        """อ่านค่าพารามิเตอร์ของสกิลติดตัว (เช่น atk_mult, poison) — default ถ้าไม่มี"""
-        s = config.skill_by_id(pet.skill) or {}
-        return s.get(key, default)
+    def _skill_def(self, sid):
+        """คืนนิยามสกิล (ที่โหลด/ผสานแล้ว) จาก id — None ถ้าไม่พบ"""
+        return self.skills_by_id.get(sid)
 
-    @staticmethod
-    def _self_val(pet, key, default=0):
-        """ค่าสกิลที่ผลกับ 'ตัวเอง' เท่านั้น (target=self) — ของ target=all ไปรวมใน _team_buffs"""
-        s = config.skill_by_id(pet.skill) or {}
-        if s.get("target", "self") != "self":
+    def _pet_skill_defs(self, pet):
+        """รายการนิยามสกิลทั้งหมดที่น้องตัวนี้ถืออยู่ (กรองตัวที่ไม่พบทิ้ง)"""
+        return [d for d in (self._skill_def(s) for s in pet.skills) if d]
+
+    def _skill_active(self, s):
+        """สกิลเป็น 'สกิลใช้งาน' (ปล่อยตอนไม้ตายเต็ม) ไหม —
+        ใช้ธง active ที่ตั้งเอง ถ้าไม่ได้ตั้งให้เดาจากมี effect hook active"""
+        if not s:
+            return False
+        if "active" in s:
+            return bool(s["active"])
+        return bool(s["_hooks"].get("active"))
+
+    def _self_val(self, pet, key, default=0):
+        """ค่า passive ที่ผลกับตัวเอง — รวมจาก 'ทุกสกิล' ที่ถืออยู่ ตามกฎรวมของแต่ละค่า
+        (atk_mult=คูณ, dmg_reduce/rage_mult/weaken=มากสุด, crit/regen/ดูดเลือด=บวก, dmg_cap=น้อยสุด)"""
+        vals = [d["_self"][key] for d in self._pet_skill_defs(pet) if key in d["_self"]]
+        if not vals:
             return default
-        return s.get(key, default)
+        rule = _SELF_AGG.get(key, "max")
+        if rule == "mul":
+            out = 1.0
+            for v in vals:
+                out *= v
+            return out
+        if rule == "sum":
+            return sum(vals)
+        if rule == "min":
+            return min(vals)
+        return max(vals)
 
-    @staticmethod
-    def _team_buffs(fighters):
-        """รวมบัฟที่ส่งผลทั้งทีม (สกิล target=all) จากน้องที่ร่วมสู้"""
+    # ค่าเดิมชื่อ _skill_val — ใช้เหมือน _self_val (อ่าน passive ของตัวเอง)
+    _skill_val = _self_val
+
+    def _team_buffs(self, fighters):
+        """รวมบัฟทีม (passive scope=team) จาก 'ทุกสกิล' ของน้องที่ร่วมสู้
+        atk_mult=คูณสะสม, dmg_reduce=มากสุด, ที่เหลือบวกรวม"""
         atk_mult, dmg_reduce, regen = 1.0, 0.0, 0
+        crit_add, lifesteal, atk_speed = 0.0, 0.0, 0.0
         for p in fighters:
-            s = config.skill_by_id(p.skill) or {}
-            if s.get("target") != "all":
-                continue
-            atk_mult *= s.get("atk_mult", 1.0)
-            dmg_reduce = max(dmg_reduce, s.get("dmg_reduce", 0.0))
-            regen += s.get("regen", 0)
-        return {"atk_mult": atk_mult, "dmg_reduce": dmg_reduce, "regen": regen}
+            for s in self._pet_skill_defs(p):
+                t = s["_team"]
+                atk_mult *= t.get("atk_mult", 1.0)
+                dmg_reduce = max(dmg_reduce, t.get("dmg_reduce", 0.0))
+                regen += t.get("regen", 0)
+                crit_add += t.get("crit_add", 0.0)    # 🎯 ออร่าแม่นยำ (ทีม)
+                lifesteal += t.get("lifesteal", 0.0)  # 🧛 ออร่าแวมไพร์ (ทีม)
+                atk_speed += t.get("atk_speed", 0.0)  # ⏩ ว่องไว/Haste (ทีม)
+        return {"atk_mult": atk_mult, "dmg_reduce": dmg_reduce, "regen": regen,
+                "crit_add": crit_add, "lifesteal": lifesteal, "atk_speed": atk_speed}
+
+    def _atk_speed_mult(self, p, team):
+        """ตัวคูณความเร็วโจมตีของน้อง — เริ่มจากค่าพื้นฐานเท่ากันทุกตัว (BASE_ATTACK_SPEED)
+        แล้วบวกจาก haste(ตัวเอง/ทีม) + รำดาบ + พายุคลั่ง; มีเพดานกันเร็วเกิน"""
+        spd = config.BASE_ATTACK_SPEED + self._self_val(p, "atk_speed", 0.0) + team.get("atk_speed", 0.0)
+        if p.as_ttl > 0:                              # 🌀 รำดาบ: สแต็กความเร็ว
+            spd += p.as_stacks * self._self_val(p, "blade_dance", 0.0)
+        if p.wf_ttl > 0:                              # 🌪 พายุคลั่ง: บัฟชั่วคราว
+            spd += self._self_val(p, "windfury", 0.0)
+        return max(0.5, min(config.ATTACK_SPEED_MAX, spd))
+
+    def _run_hook_defs(self, defs, hook, pet, **ctx):
+        """ปล่อยเอฟเฟกต์ของชุดสกิล defs ตามจังหวะ hook"""
+        for s in defs:
+            for e in s["_hooks"].get(hook, ()):
+                fn = EFFECTS.get(e["type"])
+                if fn:
+                    fn(self, pet, e, ctx)
+
+    def _run_hook(self, hook, pet, **ctx):
+        """ปล่อยเอฟเฟกต์ตามจังหวะจาก 'ทุกสกิล' ของน้อง (on_hurt/on_kill)"""
+        self._run_hook_defs(self._pet_skill_defs(pet), hook, pet, **ctx)
+
+    def _pet_active_defs(self, pet):
+        """สกิลใช้งาน (active) ทั้งหมดที่น้องถือ"""
+        return [d for d in self._pet_skill_defs(pet) if self._skill_active(d)]
+
+    def _pet_has_active(self, pet):
+        return bool(self._pet_active_defs(pet))
+
+    def _init_skills(self):
+        """โหลดนิยามสกิล (config + assets/skills.json) แล้วทำดัชนี + precompute
+        แยก passive (scope self/team) ออกจาก hooks (on_hit/on_hurt/on_kill) ไว้ล่วงหน้า"""
+        self.skills_by_id = {}
+        self.skill_pool = []
+        for s in assets.load_skills():
+            s["_self"], s["_team"], s["_hooks"] = {}, {}, {}
+            active_cds = []
+            for e in s.get("effects", ()):
+                if e.get("hook", "passive") == "passive":
+                    bucket = s["_team"] if e.get("scope") == "team" else s["_self"]
+                    bucket[e["type"]] = e.get("value", 0)
+                else:
+                    s["_hooks"].setdefault(e["hook"], []).append(e)
+                    if e["hook"] == "active":
+                        active_cds.append(e.get("cd", 10))
+            s["_active_cd"] = min(active_cds) if active_cds else 0   # คูลดาวน์สกิลกดใช้
+            self.skills_by_id[s["id"]] = s
+            if s.get("pool", True):
+                self.skill_pool.append(s)
+
+    def _random_skill(self, character=None, meta=None, rarity=None):
+        """สุ่มสกิลติดตัว 1 อัน — เคารพ pool/weight + allow-list ต่อตัวละคร (pet.json 'skills')"""
+        pool = self.skill_pool or list(self.skills_by_id.values())
+        if character is not None and meta is None:
+            meta = assets.load_character_meta(character)
+        allow = (meta or {}).get("skills")
+        if isinstance(allow, list) and allow:
+            allowed = [s for s in pool if s["id"] in allow]
+            if allowed:
+                pool = allowed
+        if rarity:                       # กรองสกิลที่ต้องการระดับความหายากขั้นต่ำ
+            order = {r["id"]: i for i, r in enumerate(config.RARITIES)}
+            ri = order.get(rarity, 0)
+            filt = [s for s in pool if order.get(s.get("rarity_min") or "common", 0) <= ri]
+            if filt:
+                pool = filt
+        if not pool:
+            return random.choice(config.SKILLS)["id"]
+        weights = [max(0.0, float(s.get("weight", 1.0))) for s in pool]
+        if sum(weights) <= 0:
+            return random.choice(pool)["id"]
+        return random.choices(pool, weights=weights, k=1)[0]["id"]
 
     def _apply_trait(self, pet):
         """ตั้งค่าผลของนิสัยประจำตัวลงบนน้อง (โจมตี/ลดสเตตัส/ความเร็ว/กิน)"""
@@ -1177,6 +1762,10 @@ class World:
         self._apply_offline_decay(data.get("last_save", 0))
         self.wave_round = max(1, int(data.get("wave_round", 1)))
         self.wave_step = min(config.WAVE_LENGTH, max(1, int(data.get("wave_step", 1))))
+        # เซฟเก่าเก็บแค่ wave_step → แปลงเป็นตัวนับใหม่ (ฆ่าแล้ว/เกิดแล้วในรอบนี้)
+        _normals = config.WAVE_LENGTH - 1
+        self.wave_killed = max(0, min(self.wave_step - 1, _normals))
+        self.wave_spawned = self.wave_killed
         # เกมใหม่เริ่มโดยปิดต่อสู้ (น้องจะได้ไม่ออโต้สู้ขึ้นเลเวลเอง) — กดเปิด ⚔ เองภายหลัง
         self.combat_enabled = bool(data.get("combat_enabled", not self._is_new_game))
         self.sound_on = bool(data.get("sound_on", True))
@@ -1197,6 +1786,9 @@ class World:
         eggs = data.get("eggs", []) or []        # ไข่ในรัง (ฟักตามเวลาจริง)
         _egg_max = config.EGG_SLOTS_BASE + config.EGG_SLOT_MAX_BUYS * config.EGG_SLOT_STEP
         self.eggs = [e for e in eggs if isinstance(e, dict)][:_egg_max]
+        # งานผสมพันธุ์ที่กำลัง "ตั้งครรภ์" (นับเวลาจริง ครบแล้วได้ไข่)
+        brd = data.get("breeding", []) or []
+        self.breeding = [b for b in brd if isinstance(b, dict)]
         stored = data.get("stored", []) or []    # น้องที่เก็บเข้ากล่อง (พักไว้ ไม่ลดสเตตัส)
         self.stored = [s for s in stored if isinstance(s, dict)][:config.MAX_STORED]
         inv = data.get("inventory", {}) or {}
@@ -1206,6 +1798,11 @@ class World:
         self.achievements = list(data.get("achievements", []))
         self.game_date = str(data.get("game_date", ""))
         self.games_today = max(0, int(data.get("games_today", 0)))
+        # เวลาในเกม (นาที สะสมตั้งแต่เริ่มเล่น) — เดินเฉพาะตอนเกมรัน
+        self.game_time = max(0.0, float(data.get("game_time", 0) or 0))
+        # รหัส/ชื่อผู้เล่น (สำหรับตลาด) — สุ่มครั้งแรก
+        self.player_id = str(data.get("player_id") or market.new_id())
+        self.player_name = str(data.get("player_name", "") or "ผู้เล่น")
         # ตำแหน่งเมนู (ลากย้ายได้)
         self.hud_offset_x = float(data.get("hud_offset_x", 0))
         self.hud_offset_y = float(data.get("hud_offset_y", 0))
@@ -1240,6 +1837,7 @@ class World:
             "quest_claimed": self.quest_claimed,
             "lifetime": self.lifetime,
             "eggs": self.eggs,
+            "breeding": self.breeding,
             "stored": self.stored,
             "egg_slot_buys": self.egg_slot_buys,
             "pet_slot_buys": self.pet_slot_buys,
@@ -1247,6 +1845,9 @@ class World:
             "achievements": self.achievements,
             "game_date": self.game_date,
             "games_today": self.games_today,
+            "game_time": round(self.game_time, 1),
+            "player_id": self.player_id,
+            "player_name": self.player_name,
             "hud_offset_x": round(self.hud_offset_x, 1),
             "hud_offset_y": round(self.hud_offset_y, 1),
         })
@@ -1293,6 +1894,8 @@ class World:
 
     def _tick(self):
         self.tick_count += 1
+        # เดินเวลาในเกม (เฉพาะตอนรัน): นาที += วินาทีจริงต่อ tick × อัตราเกม
+        self.game_time += (config.TICK_MS / 1000.0) * config.GAME_MIN_PER_REAL_SEC
         # ทุก ~0.5 วิ: ซ่อน/แสดงเพ็ทตามว่ามีโปรแกรมอื่นเปิดเต็มจออยู่หรือไม่
         if self.tick_count % max(1, int(500 / config.TICK_MS)) == 0:
             self._update_fullscreen_visibility()
@@ -1305,12 +1908,15 @@ class World:
             self._check_birthday()
             self._social_play()
             self._notify_eggs_ready()          # ไข่ครบเวลา = เด้งเตือนให้ไปกดฟักเอง
+            self._check_breeding()             # ตั้งครรภ์ครบเวลา → ออกไข่
+            self._check_market()               # จำลองมีคนซื้อของที่เราลงขาย
             self._check_adventures()
             self._tick_spawn_monster()
         if self.tick_count % max(1, int(1000 / config.TICK_MS) * 20) == 0:
             self._save_progress()   # เซฟอัตโนมัติทุก ~20 วินาที
 
-        if self.monster is not None:
+        self._tick_reinforce()                 # เกิดมอนเสริมเร็ว ๆ จนเต็ม cap ของรอบ
+        if self.monsters:
             self._update_combat()              # น้องทุกตัวรุมสู้ใน _update_combat
         for p in self.pets:
             if self._is_away(p):               # ออกผจญภัยอยู่ → ซ่อน ไม่อัปเดต
@@ -1339,6 +1945,7 @@ class World:
         self._update_effects()
         self._update_bubble()
         self._draw_hud()
+        self._draw_game_clock()
         self._draw_monster_hud()
         self._draw_combat_extras()
         self.root.after(config.TICK_MS, self._tick)
@@ -1538,19 +2145,28 @@ class World:
             pet.vx = 0
 
     def _update_combat(self):
-        """น้องทุกตัว (behavior='fight') รุมสู้มอนสเตอร์ตัวเดียว มอนตีตัวที่ใกล้สุด"""
-        m = self.monster
-        if m is None:
+        """น้องทุกตัว (behavior='fight') รุมสู้มอนหลายตัว — แต่ละฝ่ายเล็งเป้าใกล้สุด"""
+        if not self.monsters:
             return
         fighters = [p for p in self.pets if p.behavior == "fight"]
         if not fighters:                             # ไม่มีใครสู้แล้ว
             return
 
-        team = self._team_buffs(fighters)            # บัฟทั้งทีม (สกิล target=all)
+        team = self._team_buffs(fighters)            # บัฟทั้งทีม (สกิล scope=team)
         sec = (self.tick_count % self._sec_ticks == 0)   # จังหวะ "ต่อวินาที" (โชว์ DoT/ฮีล)
 
-        # ── สถานะต่อเนื่องของน้อง (โชว์เลขต่อวินาที): ไฟไหม้ 🔥 + ฮีล 💚 ──
+        # ── สถานะต่อเนื่องของน้อง: ไฟไหม้ 🔥 + ฮีล 💚 + หมดอายุบัฟ/อมตะ ──
+        # (สกิลใช้งาน = ปล่อยตอนเกจไม้ตายเต็มใน _fire_ultimate ไม่ใช่คูลดาวน์)
         for p in fighters:
+            p.invuln_ttl = max(0, p.invuln_ttl - 1)
+            p.as_ttl = max(0, p.as_ttl - 1)           # สแต็กความเร็ว (รำดาบ) หมดอายุ
+            if p.as_ttl == 0:
+                p.as_stacks = 0
+            p.wf_ttl = max(0, p.wf_ttl - 1)           # บัฟพายุคลั่งหมดอายุ
+            for _sid in list(p.skill_cd):             # นับถอยหลังคูลดาวน์สกิลใช้งาน
+                p.skill_cd[_sid] -= 1
+                if p.skill_cd[_sid] <= 0:
+                    del p.skill_cd[_sid]
             if p.burn_ttl > 0:
                 p.burn_ttl -= 1
                 if sec:
@@ -1559,69 +2175,116 @@ class World:
                                            config.STATUS_COLORS["fire"])
             if sec:
                 regen_pct = self._self_val(p, "regen", 0) + team["regen"]   # 💚 ฟื้นฟู/ทีม
+                if p.hp < p.max_hp() * 0.25:            # 🌬 ฮึดสู้ (Second Wind): เลือดต่ำ → ฟื้นพิเศษ
+                    regen_pct += self._self_val(p, "second_wind", 0)
                 if regen_pct and p.hp < p.max_hp():
                     heal = max(1, int(p.max_hp() * regen_pct / 100.0))
                     p.hp = min(p.max_hp(), p.hp + heal)
                     self.spawn_status_text(p, f"+{heal}",
                                            config.STATUS_COLORS["heal"])
+            # 🌱 เมล็ดพันธุ์ชีวิต: เลือดต่ำกว่า 30% ครั้งแรก → ฮีลก้อนใหญ่ (ครั้งเดียว/รอบ)
+            seed = self._self_val(p, "life_seed", 0)
+            if seed and not p.seed_used and p.hp < p.max_hp() * 0.3:
+                p.seed_used = True
+                heal = max(1, int(p.max_hp() * seed))
+                p.hp = min(p.max_hp(), p.hp + heal)
+                self.spawn_status_text(p, f"🌱+{heal}", config.STATUS_COLORS["heal"])
 
-        # ── พิษติดมอน ☠ (ลดเลือด + โชว์เลขต่อวินาที) ──
-        if m.poison_ttl > 0:
-            m.poison_ttl -= 1
-            if sec:
-                m.hp -= m.poison_dmg
-                self.spawn_status_text(m, f"-{m.poison_dmg}",
-                                       config.STATUS_COLORS["poison"])
-                if m.hp <= 0:
-                    self._combat_win(m, fighters)
-                    return
+        # ── DoT ติดมอนแต่ละตัว: พิษ ☠ + เลือดไหล 🩸 (ลดเลือด + โชว์ต่อวินาที) ──
+        for m in list(self.monsters):
+            if m.poison_ttl > 0:
+                m.poison_ttl -= 1
+                if sec:
+                    m.hp -= m.poison_dmg
+                    self.spawn_status_text(m, f"-{m.poison_dmg}",
+                                           config.STATUS_COLORS["poison"])
+            if m.bleed_ttl > 0:
+                m.bleed_ttl -= 1
+                if sec:
+                    m.hp -= m.bleed_dmg
+                    self.spawn_status_text(m, f"-{m.bleed_dmg}",
+                                           config.STATUS_COLORS["poison"])
+            # ☠ คำสาปสั่งตาย/ระเบิดเวลา — ครบกำหนดระเบิดดาเมจหนัก
+            if m.doom_ttl > 0:
+                m.doom_ttl -= 1
+                if m.doom_ttl == 0:
+                    m.hp -= m.doom_dmg
+                    self.spawn_effect(m.x, m.top_y(), f"☠-{m.doom_dmg}")
+            # นับถอยหลังสถานะดีบัฟ (ช้า/เปราะ/ตาบอด)
+            if m.slow_ttl > 0:
+                m.slow_ttl -= 1
+            if m.vuln_ttl > 0:
+                m.vuln_ttl -= 1
+            if m.blind_ttl > 0:
+                m.blind_ttl -= 1
+            # ── สกิลมอน: ฟื้นเลือดเอง + สกิลใช้งานปล่อยตอนเกจไม้ตายเต็ม (เหมือนน้อง) ──
+            m.invuln_ttl = max(0, m.invuln_ttl - 1)
+            m.skill_cd = max(0, m.skill_cd - 1)
+            mreg = self._mon_self(m, "regen", 0)
+            if sec and mreg and m.hp < m.max_hp:
+                heal = max(1, int(m.max_hp * mreg / 100.0))
+                m.hp = min(m.max_hp, m.hp + heal)
+                self.spawn_status_text(m, f"+{heal}", config.STATUS_COLORS["heal"])
+            ms = self._skill_def(m.skill)
+            if self._monster_has_active(m) and m.rage >= config.RAGE_MAX and m.skill_cd <= 0:
+                m.rage = 0
+                self._monster_active(m, ms, fighters)   # ปล่อยสกิลใช้งานของมอน
+                m.skill_cd = int(ms.get("cd", config.SKILL_CD_DEFAULT) * self._sec_ticks)
+                self.spawn_effect(m.x, m.top_y(), "✨")
 
-        # ── มอนสเตอร์: เล่นงานตัวที่ใกล้ที่สุด (ถ้าไม่โดนสตัน/แช่แข็ง) ──
-        tgt = min(fighters, key=lambda p: abs(p.x - m.x))
-        if m.stun_ttl > 0:                           # โดนท่าไม้ตาย/แช่แข็ง → นิ่ง
-            m.stun_ttl -= 1
-            m.set_state("hurt")
-        else:
-            m.attack_cd = max(0, m.attack_cd - 1)
-            m.set_state("walk")
-            m.face(tgt.x - m.x)
-            if abs(tgt.x - m.x) > config.ATTACK_RANGE:
-                m.x += _sign(tgt.x - m.x) * config.MONSTER_SPEED
-            elif m.attack_cd == 0:
-                if random.random() * 100 < tgt.dodge_chance():   # น้องหลบได้!
-                    self.spawn_effect(tgt.x, tgt.top_y(), "หลบ✨")
-                else:
-                    # ลดดาเมจ: เกราะตัวเอง 🛡 หรือ ปราการทั้งทีม 🔵 (เอาค่ามากสุด)
-                    reduce = max(self._self_val(tgt, "dmg_reduce", 0.0),
-                                 team["dmg_reduce"])
-                    dmg = max(1, int(m.atk * (1.0 - reduce)))
-                    tgt.hp -= dmg
-                    tgt.set_state("hurt")
-                    tgt.happy = max(0, tgt.happy - 3)
-                    rg = config.RAGE_ON_HURT * self._skill_val(tgt, "rage_mult", 1.0)
-                    tgt.rage = min(config.RAGE_MAX, tgt.rage + rg)
-                    self.spawn_effect(tgt.x, tgt.top_y(), f"-{dmg}")
-                    sound.play("hurt")
-                    if m.is_boss and tgt.burn_ttl <= 0 \
-                            and random.random() < config.BURN_CHANCE_BOSS:
-                        tgt.burn_ttl = config.BURN_SECONDS * self._sec_ticks  # บอสจุดไฟ!
-                        self.spawn_status_text(tgt, "🔥", config.STATUS_COLORS["fire"])
-                m.attack_cd = config.ATTACK_COOLDOWN
-        self._drop_to_ground(m)
-        m.sync_position()
+        # ── มอนแต่ละตัว: เล่นงานน้องที่ใกล้ที่สุด (ถ้าไม่โดนสตัน/แช่แข็ง) ──
+        for m in list(self.monsters):
+            tgt = min(fighters, key=lambda p: abs(p.x - m.x))
+            if m.stun_ttl > 0:                       # โดนท่าไม้ตาย/แช่แข็ง → นิ่ง (ท่าติด CC)
+                m.stun_ttl -= 1
+                m.set_state("cc")
+            else:
+                slow = m.slow_pct if m.slow_ttl > 0 else 0.0   # 🕸 ถูกลดความเร็ว
+                m.attack_cd = max(0, m.attack_cd - 1)
+                m.set_state("walk")
+                m.face(tgt.x - m.x)
+                engage = config.RANGED_ATTACK_RANGE if m.range_type == "ranged" else config.ATTACK_RANGE
+                if abs(tgt.x - m.x) > engage:
+                    m.x += _sign(tgt.x - m.x) * config.MONSTER_SPEED * (1.0 - slow)
+                elif m.attack_cd == 0:
+                    m.set_state("attack")            # ท่าโจมตีของมอน (มีรูปก็โชว์ ไม่มี = ใช้ idle)
+                    if m.range_type == "ranged":     # 🏹 มอนยิงโปรเจกไทล์ใส่น้อง
+                        self._spawn_monster_projectile(m, tgt, team)
+                    else:                            # ⚔ ประชิด: ตีทันที
+                        self._monster_strike(m, tgt, team)
+                    # ⏩ มอนยิงเร็วขึ้นถ้ามีสกิลความเร็วโจมตี / 🕸 ช้าลงถ้าโดน slow
+                    mas = 1.0 + self._mon_self(m, "atk_speed", 0.0)
+                    m.attack_cd = max(4, int(config.ATTACK_COOLDOWN * (1.0 + slow) / mas))
+            self._drop_to_ground(m)
+            m.sync_position()
 
-        # ── น้องทุกตัววิ่งเข้าหา + โจมตี ──
-        # ท่าโจมตีเล่นพอดีจังหวะ: 3 เฟรมเฉลี่ยตลอด cooldown, ดาเมจลงตอน "เฟรมกลาง" (ปล่อยหมัด)
-        cool = config.ATTACK_COOLDOWN
+        # ── น้องแต่ละตัว: วิ่งเข้าหา "มอนใกล้สุดของตัวเอง" + โจมตี ──
+        # ท่าโจมตีเล่นพอดีจังหวะ: ดาเมจลงตอน "เฟรมกลาง"; ล็อกเป้าตลอดสวิง (กันเป้าสลับกลางหมัด)
         for p in fighters:
             p.attack_cd = max(0, p.attack_cd - 1)
-            if abs(p.x - m.x) > config.ATTACK_RANGE:
-                self._walk_toward(p, m.x, self._speed(p))
+            tgtm = getattr(p, "_swing_target", None)
+            if tgtm is None or tgtm not in self.monsters:
+                tgtm = min(self.monsters, key=lambda mm: abs(p.x - mm.x))
+            # ระยะเริ่มตี: ranged ยืนยิงไกลกว่า / ประชิดต้องเข้าใกล้
+            engage = config.RANGED_ATTACK_RANGE if p.range_type == "ranged" else config.ATTACK_RANGE
+            dist = abs(p.x - tgtm.x)
+            if dist > engage:
+                self._walk_toward(p, tgtm.x, self._speed(p))
+                p._swing_target = None               # ยังเดินอยู่ ยังไม่ล็อกเป้า
             else:
-                p.face(m.x - p.x)
-                if p.attack_cd <= 0:                  # เริ่มสวิงรอบใหม่
-                    p.attack_cd = cool
+                # 🏹 kite: มอนเข้าใกล้เกิน → ถอยรักษาระยะ (ยังยิงได้ระหว่างถอย)
+                if (p.range_type == "ranged" and config.KITE_RANGE
+                        and dist < config.KITE_RANGE):
+                    step = (1 if p.x >= tgtm.x else -1) * self._speed(p)
+                    p.x = max(40.0, min(self.sw - 40.0, p.x + step))   # กันออกนอกจอ
+                p.face(tgtm.x - p.x)
+                if p.attack_cd <= 0:                  # เริ่มสวิงรอบใหม่ → ล็อกเป้า + ความเร็วของสวิงนี้
+                    # ⏩ ความเร็วโจมตี: cooldown สั้นลงตามตัวคูณ (haste/รำดาบ/พายุคลั่ง)
+                    p._swing_cool = max(6, int(config.ATTACK_COOLDOWN / self._atk_speed_mult(p, team)))
+                    p.attack_cd = p._swing_cool
                     p._atk_hit = False
+                    p._swing_target = tgtm
+                cool = max(1, getattr(p, "_swing_cool", config.ATTACK_COOLDOWN))
                 p.set_state("attack")
                 a = p.current_anim()
                 nf = max(1, len(a.frames))
@@ -1632,70 +2295,210 @@ class World:
                     p._render()
                 hit_frame = nf // 2                  # 3 เฟรม → เฟรมที่ 2 (index 1) = ปล่อยหมัด
                 if not getattr(p, "_atk_hit", False) and fi >= hit_frame:
-                    self._pet_hit_monster(p, m, team["atk_mult"])
+                    if p.range_type == "ranged":     # 🏹 ยิงโปรเจกไทล์ (คิดดาเมจตอนลูกไปโดน)
+                        self._spawn_projectile(p, tgtm, team)
+                    else:                            # ⚔ ประชิด: ลงดาเมจทันที
+                        self._pet_hit_monster(p, tgtm, team)
                     p._atk_hit = True
             p.sync_position()
 
-        if m.hp <= 0:                                # ชนะ! (ทั้งทีมได้ XP)
-            self._combat_win(m, fighters)
+        # ── ลูกกระสุน ranged: เลื่อนเข้าหาเป้า → ถึงแล้วคิดดาเมจ (สกิล on_hit ทำงานจุดนี้) ──
+        self._update_projectiles(team)
+
+        # ── เก็บกวาดมอนที่ตาย (จากการตี/พิษ/เลือดไหล/สะท้อน) ──
+        for m in [x for x in self.monsters if x.hp <= 0]:
+            self._on_monster_dead(m, fighters)
+        if not self.monsters:
             return
 
         # ── เกจเดือดเต็ม → ปล่อยท่าไม้ตายเอง (ไม่ต้องกด) ──
         for p in fighters:
-            if self.monster is not None and p.behavior == "fight" \
-                    and p.rage >= config.RAGE_MAX:
+            if self.monsters and p.behavior == "fight" and p.rage >= config.RAGE_MAX:
                 self._fire_ultimate(p)
-        if self.monster is None:                     # ท่าไม้ตายปิดเกมไปแล้ว
+        for m in [x for x in self.monsters if x.hp <= 0]:
+            self._on_monster_dead(m, fighters)
+        if not self.monsters:
             return
 
         # ── ใครเลือดหมด = เสียชีวิต (ต้องใช้ใบชุบ) ตัวอื่นสู้ต่อ ──
         for p in fighters:
             if p.hp <= 0:
                 self._kill_pet(p)
-        # ทั้งทีมตาย → มอนหนีไป + กลับเวฟ 1
+        # ทั้งทีมตาย → มอนหนีไปหมด + กลับเวฟ 1
         if not any(p.behavior == "fight" for p in self.pets):
             self.wave_round = 1
             self.wave_step = 1
+            self.wave_spawned = 0
+            self.wave_killed = 0
             self.show_bubble("ทีมแพ้... 💀 ต้องชุบน้องด้วยใบชุบ 📜", self.pet)
-            m.destroy()
-            self.monster = None
+            for m in list(self.monsters):
+                m.destroy()
+            self.monsters = []
+            self._clear_projectiles()
             self._save_progress()
 
-    def _pet_hit_monster(self, p, m, team_atk=1.0):
+    def _spawn_projectile(self, pet, target, team):
+        """ยิงลูกกระสุนการตีปกติ (ranged) — ดาเมจคิดตอนลูกไปโดน ใน _update_projectiles"""
+        pr = Projectile(self.canvas, pet.x, pet.y - pet.current_anim().h * 0.15,
+                        config.PROJECTILE_COLOR)
+        pr.source, pr.target, pr.pet, pr.team = "pet", target, pet, team
+        self.projectiles.append(pr)
+
+    def _spawn_monster_projectile(self, m, tgt, team):
+        """มอน ranged ยิงลูกใส่น้อง — ดาเมจคิดตอนลูกไปโดน (สีแดง)"""
+        pr = Projectile(self.canvas, m.x, m.top_y() + m.current_anim().h * 0.3, "#ff5a5a")
+        pr.source, pr.target, pr.monster, pr.team = "monster", tgt, m, team
+        self.projectiles.append(pr)
+
+    def _update_projectiles(self, team):
+        """เลื่อนลูกกระสุนเข้าหาเป้าทุก tick — ถึงแล้วลงดาเมจ (เป้าตายกลางทาง → เล็งตัวใกล้สุดใหม่)"""
+        if not self.projectiles:
+            return
+        spd = config.PROJECTILE_SPEED
+        fighters = [p for p in self.pets if p.behavior == "fight"]
+        for pr in list(self.projectiles):
+            if pr.source == "monster":           # ลูกมอน → พุ่งใส่น้อง
+                if pr.target is None or pr.target.behavior == "dead" or pr.target not in fighters:
+                    if not fighters:
+                        pr.destroy()
+                        self.projectiles.remove(pr)
+                        continue
+                    pr.target = min(fighters, key=lambda p: abs(pr.x - p.x))
+                tg = pr.target
+                ty = tg.top_y() + tg.current_anim().h * 0.3
+                dx, dy = tg.x - pr.x, ty - pr.y
+                dist = (dx * dx + dy * dy) ** 0.5 or 1.0
+                if dist <= spd + config.PROJECTILE_HIT_DIST:
+                    self._monster_strike(pr.monster, tg, pr.team or team)
+                    pr.destroy()
+                    self.projectiles.remove(pr)
+                else:
+                    pr.move_to(pr.x + dx / dist * spd, pr.y + dy / dist * spd)
+                continue
+            # ลูกน้อง → พุ่งใส่มอน
+            if pr.target not in self.monsters or pr.target.hp <= 0:
+                alive = [m for m in self.monsters if m.hp > 0]
+                if not alive:
+                    pr.destroy()
+                    self.projectiles.remove(pr)
+                    continue
+                pr.target = min(alive, key=lambda m: abs(pr.x - m.x))
+            m = pr.target
+            ty = m.top_y() + m.current_anim().h * 0.35
+            dx, dy = m.x - pr.x, ty - pr.y
+            dist = (dx * dx + dy * dy) ** 0.5 or 1.0
+            if dist <= spd + config.PROJECTILE_HIT_DIST:    # ถึงเป้า → คิดดาเมจ + สกิล on_hit
+                self._pet_hit_monster(pr.pet, m, pr.team)
+                pr.destroy()
+                self.projectiles.remove(pr)
+            else:
+                pr.move_to(pr.x + dx / dist * spd, pr.y + dy / dist * spd)
+
+    def _clear_projectiles(self):
+        for pr in self.projectiles:
+            pr.destroy()
+        self.projectiles = []
+
+    def _pet_hit_monster(self, p, m, team=None):
         """น้อง 1 ตัวฟันมอน 1 ครั้ง — รวมคริ + สกิลติดตัว (โจมตี/ดีบัฟ) + บัฟทีม + ดูดเลือด + เกจ"""
-        atk_mult = self._self_val(p, "atk_mult", 1.0) * team_atk   # ⚔ ตัวเอง × 📣 ทีม
+        team = team or {}
+        # ── การป้องกันของมอน (จากสกิลมอน): หลบ / อมตะ ──
+        if random.random() * 100 < self._mon_self(m, "dodge_add", 0):
+            self.spawn_effect(m.x, m.top_y(), "มอนหลบ")
+            return
+        if m.invuln_ttl > 0:
+            self.spawn_effect(m.x, m.top_y(), "อมตะ✨")
+            return
+        atk_mult = self._self_val(p, "atk_mult", 1.0) * team.get("atk_mult", 1.0)
         dmg = int(p.attack() * atk_mult)
-        crit_chance = p.crit_chance() + self._skill_val(p, "crit_add")  # 🎯 แม่นปืน
+        crit_chance = (p.crit_chance() + self._skill_val(p, "crit_add")   # 🎯 แม่นปืน
+                       + team.get("crit_add", 0.0))                       # 🎯 ออร่าแม่นยำ (ทีม)
         crit = random.random() * 100 < crit_chance
         if crit:
             dmg = int(dmg * config.CRIT_MULT)
+        if m.vuln_ttl > 0:                          # 💢 คำสาป/เปราะ → รับดาเมจเพิ่ม
+            dmg = int(dmg * (1.0 + m.vuln_pct))
+        # 🎯 ล็อคเป้า (Focus): ตีเป้าเดิมซ้ำ → ดาเมจสะสม (สูงสุด 5 สแต็ก)
+        fpct = self._self_val(p, "focus", 0.0)
+        if fpct:
+            if p.focus_target is m:
+                p.focus_stacks = min(5, p.focus_stacks + 1)
+            else:
+                p.focus_target = m
+                p.focus_stacks = 0
+            if p.focus_stacks:
+                dmg = int(dmg * (1.0 + fpct * p.focus_stacks))
+        # 🛡 เกราะมอน (บอส/สกิล) ลดดาเมจ — ⛏ เจาะเกราะ (pierce) เพิกเฉยเกราะบางส่วน
+        eff_armor = max(0.0, m.armor - m.armor_shred) * (1.0 - self._self_val(p, "pierce", 0.0))
+        if eff_armor > 0:
+            dmg = max(1, int(dmg * (1.0 - eff_armor)))
+        if m.shield > 0:                            # 🛡 โล่ของมอน (สกิลบาเรีย) ดูดก่อน
+            absorbed = min(m.shield, dmg)
+            m.shield -= absorbed
+            dmg -= absorbed
         m.hp -= dmg
+        if self._monster_has_active(m):             # มอนสะสมเกจไม้ตายเมื่อโดนตี
+            m.rage = min(config.RAGE_MAX, m.rage + config.RAGE_ON_HURT)
+        # 🌵 หนามสะท้อนของมอน → สะท้อนกลับน้องผู้ตี
+        mth = 0.0
+        ms = self._skill_def(m.skill)
+        if ms:
+            for e in ms["_hooks"].get("on_hurt", ()):
+                if e["type"] == "thorns":
+                    mth = max(mth, e.get("pct", 0.15))
+        if mth and dmg > 0:
+            r = max(1, int(dmg * mth))
+            p.hp -= r
+            self.spawn_effect(p.x, p.top_y(), f"-{r}")
+        # 🌀 รำดาบ (Blade Dance): ตีโดน → สะสมสแต็กความเร็ว (หมดอายุถ้าหยุดตี)
+        if self._self_val(p, "blade_dance", 0.0):
+            p.as_stacks = min(5, p.as_stacks + 1)
+            p.as_ttl = 3 * self._sec_ticks
+        # 🌪 พายุคลั่ง (Windfury): ทุกหมัดที่ 3 → บัฟความเร็วชั่วคราว
+        if self._self_val(p, "windfury", 0.0):
+            p.wf_count += 1
+            if p.wf_count % 3 == 0:
+                p.wf_ttl = 3 * self._sec_ticks
         p.set_state("attack")
         rg = config.RAGE_ON_HIT * self._skill_val(p, "rage_mult", 1.0)   # 🔥 เดือดดาล
         p.rage = min(config.RAGE_MAX, p.rage + rg)
         self.spawn_effect(m.x, m.top_y(), f"💥-{dmg}" if crit else f"-{dmg}")
-        # 🗡 ดาบคู่: มีโอกาสตีเพิ่มอีกครั้ง
-        if random.random() < self._skill_val(p, "double"):
-            d2 = int(p.attack() * atk_mult)
-            m.hp -= d2
-            self.spawn_effect(m.x + 12, m.top_y() - 8, f"-{d2}")
-        # ── ดีบัฟติดมอน ──
-        poison = self._skill_val(p, "poison")          # ☠ พิษ (ดาเมจต่อวินาที)
-        if poison:
-            m.poison_ttl = config.POISON_SECONDS * self._sec_ticks
-            m.poison_dmg = max(m.poison_dmg, poison)
-        if random.random() < self._skill_val(p, "freeze_chance"):   # ❄ เยือกแข็ง
-            m.stun_ttl = max(m.stun_ttl, int(self._skill_val(p, "freeze", 0)))
-            self.spawn_status_text(m, "❄", config.STATUS_COLORS["ice"])
-        # ── ดูดเลือด (บิลด์ 🩸) ──
-        ls = p.lifesteal_pct()
+        # สกิล on_hit: ติดตอนตีปกติ "เฉพาะสกิลพาสซีฟ" (สกิลใช้งานเก็บไว้ปล่อยตอนไม้ตาย)
+        passive_defs = [d for d in self._pet_skill_defs(p) if not self._skill_active(d)]
+        self._run_hook_defs(passive_defs, "on_hit", p, target=m, dmg=dmg, atk_mult=atk_mult)
+        # ── ดูดเลือด (บิลด์ 🩸 + สกิลตัวเอง + ออร่าแวมไพร์ของทีม 🧛) ──
+        ls = p.lifesteal_pct() + self._self_val(p, "lifesteal", 0.0) + team.get("lifesteal", 0.0)
         if ls > 0 and p.hp < p.max_hp():
-            total = dmg
-            p.hp = min(p.max_hp(), p.hp + max(1, int(total * ls / 100.0)))
+            p.hp = min(p.max_hp(), p.hp + max(1, int(dmg * ls / 100.0)))
+        # ฆ่ามอนด้วยหมัดนี้ → สกิล on_kill (ปิดฉาก: คืนเกจไม้ตาย)
+        if m.hp <= 0:
+            self._run_hook("on_kill", p, target=m)
         sound.play("attack")
+
+    @staticmethod
+    def _reset_combat_state(pet):
+        """รีเซ็ตสถานะต่อสู้ชั่วคราวเมื่อน้องเพิ่งเข้าสู้ (โล่/อมตะ/คูลดาวน์/กันตาย)"""
+        pet.shield = 0
+        pet.invuln_ttl = 0
+        pet.skill_cd = {}
+        pet.last_stand_used = False
+        pet._swing_target = None
+        pet.as_stacks = pet.as_ttl = pet.wf_count = pet.wf_ttl = 0
+        pet.focus_target = None
+        pet.focus_stacks = 0
+        pet.seed_used = False
 
     def _kill_pet(self, pet):
         """น้องเสียชีวิต — ต้องใช้ใบชุบเท่านั้นถึงฟื้น (ไม่ฟื้นเอง)"""
+        # 🆘 ไม่ยอมตาย (Last Stand): กันตายครั้งเดียว/รอบ → เด้งมา 1 HP + อมตะชั่วครู่
+        ls = self._self_val(pet, "last_stand", 0)
+        if ls and not pet.last_stand_used:
+            pet.last_stand_used = True
+            pet.hp = 1
+            pet.invuln_ttl = int(ls) * self._sec_ticks
+            self.show_bubble("ไม่ยอมตาย! 🆘", pet)
+            self.spawn_status_text(pet, "🆘", config.STATUS_COLORS["heal"])
+            return
         pet.hp = 0
         pet.behavior = "dead"
         pet.vx = 0
@@ -1707,11 +2510,38 @@ class World:
         self.spawn_effect(pet.x, pet.top_y(), "💀")
 
     def _fire_ultimate(self, pet):
-        """ปล่อยท่าไม้ตาย — ดาเมจหนักใส่มอน + สตันมอน (ใช้ได้เมื่อเกจเดือดเต็มและกำลังสู้)"""
-        m = self.monster
-        if m is None or pet.behavior != "fight" or pet.rage < config.RAGE_MAX:
+        """เกจไม้ตายเต็ม → ปล่อย:
+        - น้องที่มี 'สกิลใช้งาน' → สุ่มเลือก 1 สกิลที่ไม่ติดคูลดาวน์มาปล่อย (แล้วเข้าคูลดาวน์)
+        - ถ้าสกิลใช้งานทุกตัวติดคูลดาวน์ → รอ (เกจยังเต็ม)
+        - น้องที่ไม่มีสกิลใช้งาน → ท่าไม้ตายปกติ (ดาเมจหนัก + สตัน)"""
+        if not self.monsters or pet.behavior != "fight" or pet.rage < config.RAGE_MAX:
             return
+        active_defs = self._pet_active_defs(pet)
+        if active_defs:
+            ready = [d for d in active_defs if pet.skill_cd.get(d["id"], 0) <= 0]
+            if not ready:
+                return                                # ทุกสกิลใช้งานติดคูลดาวน์ → รอ
+            sdef = random.choice(ready)               # สุ่มเลือก 1 สกิลใช้งาน
+            pet.rage = 0
+            fighters = [p for p in self.pets if p.behavior == "fight"]
+            self._run_hook_defs([sdef], "active", pet, fighters=fighters)   # บัฟ/โล่/ฮีล (ถ้ามี)
+            if sdef["_hooks"].get("on_hit"):          # ดีบัฟ/พิษ → ใส่มอนใกล้สุด + ดาเมจไม้ตาย
+                m = min(self.monsters, key=lambda mm: abs(pet.x - mm.x))
+                dmg = pet.ult_damage()
+                m.hp -= dmg
+                self.spawn_effect(m.x, m.top_y(), f"⚡-{dmg}")
+                self._run_hook_defs([sdef], "on_hit", pet, target=m, dmg=dmg, atk_mult=1.0)
+                if m.hp <= 0:
+                    self._on_monster_dead(m, fighters)
+            pet.skill_cd[sdef["id"]] = int(sdef.get("cd", config.SKILL_CD_DEFAULT) * self._sec_ticks)
+            pet.set_state("attack")
+            self.show_bubble(f"ท่าไม้ตาย: {sdef.get('name', 'สกิล')}! ✨", pet)
+            self.spawn_effect(pet.x, pet.top_y(), "✨")
+            sound.play("levelup")
+            return
+        # ── ท่าไม้ตายปกติ (ไม่มีสกิลใช้งาน) ──
         pet.rage = 0
+        m = min(self.monsters, key=lambda mm: abs(pet.x - mm.x))
         dmg = pet.ult_damage()
         m.hp -= dmg
         m.stun_ttl = max(m.stun_ttl, config.ULT_STUN_TICKS)
@@ -1721,33 +2551,43 @@ class World:
         self.spawn_effect(m.x, m.top_y() - 18, "💫")
         sound.play("attack")
         if m.hp <= 0:
-            self._combat_win(m, [p for p in self.pets if p.behavior == "fight"])
+            self._on_monster_dead(m, [p for p in self.pets if p.behavior == "fight"])
 
-    def _combat_win(self, m, fighters):
+    def _on_monster_dead(self, m, fighters):
+        """มอน 1 ตัวตาย — แจกรางวัล + นับเวฟ; ฆ่าบอส = ขึ้นเวฟใหม่; เคลียร์จอ = น้องกลับไปเดิน"""
         was_boss = m.is_boss
         self.spawn_effect(m.x, m.top_y(), "✨")
         sound.play("win")
+        # 🦠 โรคระบาด: ตายแล้วแพร่พิษใส่มอนใกล้สุดที่ยังไม่ติด
+        if m.plague and m.poison_dmg > 0:
+            others = [x for x in self.monsters if x is not m and not x.plague and x.hp > 0]
+            if others:
+                x = min(others, key=lambda o: abs(o.x - m.x))
+                x.poison_ttl = config.POISON_SECONDS * self._sec_ticks
+                x.poison_dmg = max(x.poison_dmg, m.poison_dmg)
+                x.plague = True
+                self.spawn_status_text(x, "🦠", config.STATUS_COLORS["poison"])
         m.destroy()
-        self.monster = None
-        for p in fighters:                           # น้องทุกตัวที่สู้กลับมาเดิน + ดีใจ + ได้ XP
-            p.behavior = "wander"
-            p.vx = 0
-            p.happy = min(100, p.happy + 20)
-            p.burn_ttl = 0                            # ดับไฟหลังจบศึก (เกจเดือดเก็บไว้)
-        lead = fighters[0]
+        if m in self.monsters:
+            self.monsters.remove(m)
+        self.wave_killed += 1
+        lead = fighters[0] if fighters else self.pet
         if was_boss:
             self.wave_round += 1
             self.wave_step = 1
+            self.wave_spawned = 0
+            self.wave_killed = 0
             self.show_bubble(f"🏆 ผ่านบอส! ขึ้นเวฟ {self.wave_round}", lead)
-            self.spawn_effect(lead.x, lead.top_y(), "🎉")
+            if lead:
+                self.spawn_effect(lead.x, lead.top_y(), "🎉")
             for p in fighters:
                 self.add_xp(config.XP_PER_WIN * config.BOSS_XP_MULT, p)
             self.add_coins(config.COINS_PER_BOSS)
             self._quest_advance("boss")
             self._inc_lifetime("bosses")
         else:
-            self.wave_step += 1
-            self.show_bubble(f"ชนะ! ({self.wave_step}/{config.WAVE_LENGTH}) 🎉", lead)
+            self.wave_step = min(config.WAVE_LENGTH, self.wave_killed + 1)
+            self.show_bubble(f"ชนะ! ({self.wave_killed}/{config.WAVE_LENGTH}) 🎉", lead)
             for p in fighters:
                 self.add_xp(config.XP_PER_WIN, p)
             self.add_coins(config.COINS_PER_WIN)
@@ -1762,7 +2602,18 @@ class World:
             rar = assets.character_rarity(char) if char else "common"
             rname = config.rarity_by_id(rar)["name"]
             self.show_bubble(f"🥚 ได้ไข่ระดับ {rname}!", lead)
-            self.spawn_effect(lead.x, lead.top_y(), "🥚")
+            if lead:
+                self.spawn_effect(lead.x, lead.top_y(), "🥚")
+        # เคลียร์จอ/จบรอบ → น้องทุกตัวที่สู้กลับมาเดิน + ดีใจ + ดับไฟ
+        if not self.monsters:
+            self._clear_projectiles()
+            for p in fighters:
+                if p.behavior == "fight":
+                    p.behavior = "wander"
+                    p.vx = 0
+                    p.happy = min(100, p.happy + 20)
+                    p.burn_ttl = 0
+                    p._swing_target = None
         self._save_progress()
 
     def _update_dead(self, pet):
@@ -1816,13 +2667,15 @@ class World:
         """ออร่าวงรีที่เท้าน้องตามชนิดสกิลบัฟ: แดง=โจมตี ฟ้า=ป้องกัน เขียว=ฮีล
         แสดงเฉพาะ 'ตอนต่อสู้' (มีมอน + น้องกำลังสู้) เท่านั้น"""
         self.canvas.delete("aura")
-        if self.monster is None:                 # ไม่ได้สู้ = ไม่โชว์บัฟ
+        if not self.monsters:                    # ไม่ได้สู้ = ไม่โชว์บัฟ
             return
         for pet in self.pets:
             if pet.behavior != "fight" or self._is_away(pet):
                 continue
-            s = config.skill_by_id(pet.skill) or {}
-            col = config.AURA_COLORS.get(s.get("aura"))
+            # ออร่า = สีของสกิลแรกที่มีออร่า (ถือหลายสกิลได้)
+            col = next((config.AURA_COLORS[s["aura"]]
+                        for s in self._pet_skill_defs(pet)
+                        if s.get("aura") in config.AURA_COLORS), None)
             if not col:
                 continue
             a = pet.current_anim()
@@ -1982,12 +2835,16 @@ class World:
             return "break"
         self._close_all_menus()
         self.combat_enabled = not self.combat_enabled
-        if not self.combat_enabled and self.monster is not None:
-            self.monster.destroy()          # ปิดต่อสู้ = เอามอนสเตอร์ออกทันที
-            self.monster = None
-            if self.pet and self.pet.behavior != "dead":
-                self.pet.behavior = "wander"
-                self.pet.vx = 0
+        if not self.combat_enabled and self.monsters:
+            for m in list(self.monsters):   # ปิดต่อสู้ = เอามอนสเตอร์ออกทุกตัวทันที
+                m.destroy()
+            self.monsters = []
+            self._clear_projectiles()
+            for p in self.pets:
+                if p.behavior == "fight":
+                    p.behavior = "wander"
+                    p.vx = 0
+                    p._swing_target = None
         self.show_bubble("⚔ พร้อมแล้ว!" if self.combat_enabled else "😴 พักผ่อน")
         self._save_progress()
         self._draw_hud()
@@ -2213,10 +3070,12 @@ class World:
                       font=("Segoe UI", 12), padx=12, pady=8, cursor="hand2",
                       width=28).pack(fill="x", anchor="w", pady=3)
 
-        tk.Button(fr, text="ปิด", command=self._close_shop_window, bg="#3a3a3a",
-                  fg=FG, activebackground="#4a4a4a", activeforeground=FG, bd=0,
-                  font=("Segoe UI", 11, "bold"), cursor="hand2",
-                  padx=20, pady=4).pack(pady=(12, 0))
+        foot = tk.Frame(fr, bg=BG)
+        foot.pack(pady=(12, 0))
+        self._feature_btn(foot, "‹ เมนู", self._show_main_menu, color="#3a4150",
+                          padx=16, pady=4).pack(side="left", padx=4)
+        self._feature_btn(foot, "ปิด", self._close_shop_window, color="#3a3a3a",
+                          padx=20, pady=4).pack(side="left", padx=4)
         refresh()
         self._center_popup(win)
 
@@ -2294,7 +3153,7 @@ class World:
 
     def _show_bag_window(self):
         _nm = (self.pet.name or "เพ็ท") if self.pet else "เพ็ท"
-        win, fr = self._feature_popup(f"🎒  กระเป๋า — {_nm}")
+        win, fr = self._feature_popup(f"🎒  กระเป๋า — {_nm}", back=True)
         BG, SUB, FG = "#1e1e1e", "#bbbbbb", "#ffffff"
         tab = getattr(self, "_bag_tab", "items")
 
@@ -2442,9 +3301,12 @@ class World:
         btn.pack()
         tk.Label(fr, text="ล็อกอินติดกันทุกวัน รางวัลยิ่งเยอะ (พลาดวัน = เริ่มใหม่)",
                  bg=BG, fg="#888", font=("Segoe UI", 9)).pack(pady=(10, 0))
-        tk.Button(fr, text="ปิด", command=self._close_checkin_window, bg="#2c3e50",
-                  fg=FG, activebackground="#34495e", bd=0, font=("Segoe UI", 11, "bold"),
-                  cursor="hand2", padx=20, pady=4).pack(pady=(12, 0))
+        foot = tk.Frame(fr, bg=BG)
+        foot.pack(pady=(12, 0))
+        self._feature_btn(foot, "‹ เมนู", self._show_main_menu, color="#3a4150",
+                          padx=16, pady=4).pack(side="left", padx=4)
+        self._feature_btn(foot, "ปิด", self._close_checkin_window, color="#2c3e50",
+                          padx=20, pady=4).pack(side="left", padx=4)
         self._center_popup(win)
 
     # --------------------------------------------------------------- เควสรายวัน
@@ -2501,14 +3363,18 @@ class World:
                 tk.Label(row, text=f"+{q['reward']} 🪙", bg=BG, fg=SUB,
                          font=("Segoe UI", 10)).pack(side="right")
 
-        tk.Button(fr, text="ปิด", command=self._close_quest_window, bg="#2c3e50",
-                  fg=FG, activebackground="#34495e", bd=0, font=("Segoe UI", 11, "bold"),
-                  cursor="hand2", padx=20, pady=4).pack(pady=(14, 0))
+        foot = tk.Frame(fr, bg=BG)
+        foot.pack(pady=(14, 0))
+        self._feature_btn(foot, "‹ เมนู", self._show_main_menu, color="#3a4150",
+                          padx=16, pady=4).pack(side="left", padx=4)
+        self._feature_btn(foot, "ปิด", self._close_quest_window, color="#2c3e50",
+                          padx=20, pady=4).pack(side="left", padx=4)
         self._center_popup(win)
 
     # ============================================ เกม/ของสะสม/ทริค/ความสำเร็จ
-    def _feature_popup(self, title):
-        """สร้าง Toplevel ธีมเข้มมาตรฐาน (ปิดอันเก่าก่อน) คืน (win, frame หลัก)"""
+    def _feature_popup(self, title, back=False):
+        """สร้าง Toplevel ธีมเข้มมาตรฐาน (ปิดอันเก่าก่อน) คืน (win, frame หลัก)
+        back=True → มีปุ่ม '‹ เมนู' บนหัวสำหรับย้อนกลับไปเมนูหลัก"""
         self._close_all_menus()
         self._close_feature_window()
         BG = "#1e1e1e"
@@ -2519,8 +3385,14 @@ class World:
         self._feature_window = win
         fr = tk.Frame(win, bg=BG, padx=18, pady=16)
         fr.pack(padx=2, pady=2)
-        tk.Label(fr, text=title, bg=BG, fg="#f1c40f",
-                 font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        head = tk.Frame(fr, bg=BG)
+        head.pack(fill="x")
+        if back:
+            self._feature_btn(head, "‹ เมนู", self._show_main_menu, color="#3a4150",
+                              font=("Segoe UI", 9, "bold"), padx=8, pady=2).pack(side="left",
+                                                                                 padx=(0, 8))
+        tk.Label(head, text=title, bg=BG, fg="#f1c40f",
+                 font=("Segoe UI", 14, "bold")).pack(side="left")
         self._bind_autoclose(win, self._close_feature_window)
         return win, fr
 
@@ -2947,7 +3819,7 @@ class World:
     # ---- ความสำเร็จ (Achievement) ----------------------------------------
     def _show_achievements_window(self):
         self._check_achievements()
-        win, fr = self._feature_popup("🏆  ความสำเร็จ")
+        win, fr = self._feature_popup("🏆  ความสำเร็จ", back=True)
         BG, SUB, FG = "#1e1e1e", "#bbbbbb", "#ffffff"
         done, total = len(self.achievements), len(config.ACHIEVEMENTS)
         tk.Label(fr, text=f"ปลดล็อกแล้ว {done}/{total}", bg=BG, fg=SUB,
@@ -3355,8 +4227,8 @@ class World:
 
     # ---------------------------------------------- ผสมพันธุ์ / ไข่ / ฟัก
     def _make_egg(self, character, likes=None, dislikes=None, trait=None,
-                  skill=None, rarity=None):
-        """เพิ่มไข่ลงรัง (ฟักตามเวลาจริง) — คืน False ถ้ารังเต็ม"""
+                  skills=None, rarity=None):
+        """เพิ่มไข่ลงรัง (ฟักตามเวลาจริง) — skills=list สกิลที่สืบทอด (None=สุ่ม 1); คืน False ถ้ารังเต็ม"""
         if len(self.eggs) >= self._egg_cap():
             return False
         meta = assets.load_character_meta(character)
@@ -3364,17 +4236,24 @@ class World:
         lk = likes if likes is not None else meta.get("likes", [])
         dk = dislikes if dislikes is not None else meta.get("dislikes", [])
         valid_traits = {t["id"] for t in config.TRAITS}
-        valid_skills = {s["id"] for s in config.SKILLS}
         valid_rar = {r["id"] for r in config.RARITIES}
         # ระดับไข่ = ระดับของตัวละครนั้น (ถ้าไม่ส่ง rarity มา) — ตัวละคร None = ปกติ
         if rarity not in valid_rar:
             rarity = assets.character_rarity(character) if character else "common"
+        # สกิล: ใช้ที่สืบทอดมา (กรองให้ถูกต้อง) ไม่งั้นสุ่ม 1 สกิล
+        if skills is None:
+            egg_skills = [self._random_skill(character, meta, rarity)]
+        else:
+            egg_skills = [s for s in dict.fromkeys(skills)
+                          if s in self.skills_by_id][:config.PET_MAX_SKILLS]
+            if not egg_skills:
+                egg_skills = [self._random_skill(character, meta, rarity)]
         self.eggs.append({
             "character": character,
             "likes": [v for v in lk if v in valid],
             "dislikes": [v for v in dk if v in valid],
             "trait": trait if trait in valid_traits else random.choice(config.TRAITS)["id"],
-            "skill": skill if skill in valid_skills else random.choice(config.SKILLS)["id"],
+            "skills": egg_skills,
             "rarity": rarity,
             "hatch_at": time.time() + config.HATCH_SECONDS,
         })
@@ -3406,11 +4285,16 @@ class World:
             self.show_bubble("เต็มทั้งจอและกล่องเก็บ! ปล่อยน้องก่อน")
             sound.play("hurt")
             return
-        # สุ่มนิสัย + สกิลติดตัว ตอนฟัก (ไม่ส่ง trait/skill → _build_pet สุ่มให้)
+        # สืบทอด นิสัย + สกิลติดตัว จากไข่ (ผสมพันธุ์ = ของพ่อ/แม่, ดรอป = สุ่มไว้ตอนได้ไข่)
         # ความหายากมาจากไข่ (rarity ของไข่ = ระดับของตัวละครที่ฟักออกมา)
+        egg_skills = egg.get("skills")
+        if not isinstance(egg_skills, list):         # ไข่เก่าเก็บ "skill" เดี่ยว
+            egg_skills = [egg["skill"]] if egg.get("skill") else None
         pd = {"character": egg.get("character"),
               "likes": egg.get("likes", []),
               "dislikes": egg.get("dislikes", []),
+              "trait": egg.get("trait"),
+              "skills": egg_skills,
               "rarity": egg.get("rarity", "common"),
               "birth_date": self._today()}
         pet = self._build_pet(egg.get("character"), pd)
@@ -3441,7 +4325,8 @@ class World:
     def _show_hatch_window(self, forced=False):
         """เมนูฟักไข่ — รูปไข่ + ระดับความหายาก, ฟัก/ขายทีละฟอง, ขยายช่องไข่ได้
         forced=True (เริ่มเกมครั้งแรก) = ออกไม่ได้จนกว่าจะกดฟัก (ไม่มีปุ่มปิด/ขาย/ล็อกหน้าจอ)"""
-        win, fr = self._feature_popup(f"🐣  ฟักไข่ ({len(self.eggs)}/{self._egg_cap()})")
+        win, fr = self._feature_popup(f"🐣  ฟักไข่ ({len(self.eggs)}/{self._egg_cap()})",
+                                      back=not forced)   # เกมใหม่บังคับฟัก = ไม่มีปุ่มย้อนกลับ
         BG, SUB, FG = "#1e1e1e", "#bbbbbb", "#ffffff"
         full = len(self.pets) >= self._pet_cap()
         icon = self._egg_icon()
@@ -3531,11 +4416,11 @@ class World:
                 and self._age_days(pet) >= config.BREED_MIN_AGE_DAYS)
 
     def _breed(self, a, b):
-        """ผสมพันธุ์ 2 ตัว → ได้ไข่ (ลูกได้ร่าง+ความชอบผสมจากพ่อแม่)"""
+        """จับคู่ผสมพันธุ์ → เริ่ม 'ตั้งครรภ์' (มีระยะเวลา) ครบแล้วได้ไข่"""
         if a is b or a not in self.pets or b not in self.pets:
             return
-        if len(self.eggs) >= self._egg_cap():
-            self.show_bubble("รังไข่เต็มแล้ว!")
+        if len(self.eggs) + len(self.breeding) >= self._egg_cap():
+            self.show_bubble("รังไข่เต็มแล้ว! (รวมที่กำลังตั้งครรภ์)")
             return
         if not (self._can_breed(a) and self._can_breed(b)):
             self.show_bubble("น้องยังไม่พร้อม (ต้องโต + รักพอ)")
@@ -3554,20 +4439,277 @@ class World:
         likes = list(dict.fromkeys(list(a.likes) + list(b.likes)))[:3]
         dislikes = [d for d in dict.fromkeys(list(a.dislikes) + list(b.dislikes))
                     if d not in likes][:2]
-        # นิสัยสืบทอดจากพ่อแม่ (มีโอกาสกลายพันธุ์)
-        if random.random() < 0.15:
-            child_trait = random.choice(config.TRAITS)["id"]
-        else:
-            child_trait = random.choice([a.trait, b.trait])
-        # สกิลติดตัว: มีโอกาสสืบทอดของพ่อ/แม่ (ที่เหลือ = สุ่มใหม่/กลายพันธุ์)
-        if random.random() < config.SKILL_INHERIT_CHANCE:
-            child_skill = random.choice([a.skill, b.skill])
-        else:
-            child_skill = random.choice(config.SKILLS)["id"]
-        self._make_egg(child_char, likes, dislikes, child_trait, child_skill)
+        # นิสัย: สุ่มใหม่หมด (ไม่สืบทอด)
+        child_trait = random.choice(config.TRAITS)["id"]
+        # สกิล: สืบทอด "ทีละสกิลของพ่อ/แม่" (มีโอกาสได้ทั้งคู่) + มีโอกาสได้สกิลใหม่เพิ่ม
+        child_skills = []
+        for parent in (a, b):
+            for sid in parent.skills:
+                if sid and sid not in child_skills \
+                        and random.random() < config.SKILL_INHERIT_CHANCE:
+                    child_skills.append(sid)
+        if random.random() < config.BREED_NEW_SKILL_CHANCE:      # โอกาสได้สกิลใหม่ 1 อัน
+            ns = self._random_skill(child_char)
+            if ns and ns not in child_skills:
+                child_skills.append(ns)
+        if not child_skills:                                     # กันลูกไม่มีสกิลเลย
+            child_skills = [self._random_skill(child_char)]
+        child_skills = child_skills[:config.PET_MAX_SKILLS]
+        # ระดับ: เริ่มจากระดับสูงสุดของพ่อแม่ แล้วมีโอกาสอัปขึ้นทีละขั้น (แม้พ่อแม่ปกติ)
+        order = [r["id"] for r in config.RARITIES]
+        idx = max(order.index(a.rarity) if a.rarity in order else 0,
+                  order.index(b.rarity) if b.rarity in order else 0)
+        while idx < len(order) - 1 and random.random() < config.BREED_RARITY_UP_CHANCE:
+            idx += 1
+        child_rarity = order[idx]
+        # เริ่ม "ตั้งครรภ์": เก็บข้อมูลลูกไว้ก่อน รอครบเวลา BREED_SECONDS แล้วค่อยได้ไข่
+        self.breeding.append({
+            "character": child_char, "likes": likes, "dislikes": dislikes,
+            "trait": child_trait, "skills": child_skills, "rarity": child_rarity,
+            "ready_at": time.time() + config.BREED_SECONDS,
+        })
         sound.play("levelup")
-        self.show_bubble("💕 ได้ไข่มาแล้ว! รอฟัก 🥚")
+        mins = max(1, config.BREED_SECONDS // 60)
+        self.show_bubble(f"💕 จับคู่แล้ว! ตั้งครรภ์ ~{mins} นาที 🤰")
         self._save_progress()
+
+    def _check_breeding(self):
+        """งานตั้งครรภ์ครบเวลา → ออกไข่ลงรัง (ถ้ารังไม่เต็ม) — เรียกทุก ~1 วินาที"""
+        now = time.time()
+        done = [b for b in self.breeding if now >= float(b.get("ready_at", 0))]
+        for b in done:
+            if len(self.eggs) >= self._egg_cap():
+                continue                          # รังเต็ม → รอช่องว่าง (ยังไม่เอาออก)
+            self.breeding.remove(b)
+            self._make_egg(b.get("character"), b.get("likes"), b.get("dislikes"),
+                           b.get("trait"), skills=b.get("skills"), rarity=b.get("rarity"))
+            self.show_bubble("🐣 คลอดไข่แล้ว! ไปฟักได้เลย 🥚")
+            sound.play("levelup")
+            self._save_progress()
+
+    # ---------------------------------------------- ตลาดซื้อขาย (ไข่/สัตว์เลี้ยง)
+    def _market_price(self, kind, data):
+        """ราคาตั้งขายแนะนำ — ตามระดับความหายาก (สัตว์เลี้ยงแพงกว่าตามเลเวล)"""
+        sell = config.rarity_by_id(data.get("rarity", "common")).get("sell", 20)
+        base = sell * config.MARKET_PRICE_MULT
+        if kind == "pet":
+            base *= (2 + int(data.get("level", 1)) / 5.0)
+        return max(1, int(base))
+
+    def _seed_npc_offers(self):
+        """เติมรายการของ 'ผู้เล่นอื่น (NPC)' ให้พอ — เมื่อต่อ API จริงให้เลิก seed ตรงนี้"""
+        npc = [o for o in self.market.fetch()
+               if str(o.get("seller_id", "")).startswith("npc:")]
+        for _ in range(max(0, config.MARKET_NPC_MIN - len(npc))):
+            kind = "pet" if random.random() < 0.35 else "egg"
+            char = self._weighted_character()
+            rarity = self._roll_rarity()
+            meta = assets.load_character_meta(char)
+            skills = [self._random_skill(char, rarity=rarity)]
+            if random.random() < 0.3:
+                s2 = self._random_skill(char, rarity=rarity)
+                if s2 not in skills:
+                    skills.append(s2)
+            data = {"character": char, "rarity": rarity,
+                    "trait": random.choice(config.TRAITS)["id"], "skills": skills,
+                    "likes": meta.get("likes", []), "dislikes": meta.get("dislikes", [])}
+            if kind == "pet":
+                data["level"] = random.randint(1, 12)
+                data["gender"] = random.choice(["m", "f"])
+            price = int(self._market_price(kind, data) * random.uniform(0.85, 1.25))
+            self.market.post(market.make_offer("npc:" + market.new_id(),
+                                               random.choice(config.MARKET_SELLER_NAMES),
+                                               price, kind, data))
+
+    def _market_receive(self, offer):
+        """รับของเข้าคลัง: ไข่→รัง / น้อง→จอ(เต็มเข้ากล่อง) — คืน True ถ้าสำเร็จ"""
+        data = offer.get("data", {})
+        if offer.get("kind") == "pet":
+            if len(self.pets) < self._pet_cap():
+                self.pets.append(self._build_pet(data.get("character"), data))
+            elif len(self.stored) < config.MAX_STORED:
+                self.stored.append(data)
+            else:
+                self.show_bubble("เต็มทั้งจอและกล่อง! ปล่อยน้องก่อน")
+                return False
+            return True
+        if len(self.eggs) >= self._egg_cap():
+            self.show_bubble("รังไข่เต็ม!")
+            return False
+        self._make_egg(data.get("character"), data.get("likes"), data.get("dislikes"),
+                       data.get("trait"), skills=data.get("skills"), rarity=data.get("rarity"))
+        return True
+
+    def _market_list_egg(self, egg):
+        if egg not in self.eggs:
+            return
+        price = self._market_price("egg", egg)
+        data = {"character": egg.get("character"), "rarity": egg.get("rarity", "common"),
+                "trait": egg.get("trait", ""), "skills": egg.get("skills", []),
+                "likes": egg.get("likes", []), "dislikes": egg.get("dislikes", [])}
+        if self.market.post(market.make_offer(self.player_id, self.player_name,
+                                              price, "egg", data)):
+            self.eggs.remove(egg)
+            sound.play("eat")
+            self.show_bubble(f"ลงขายไข่ในตลาด ราคา {price} 🪙")
+            self._save_progress()
+
+    def _market_list_stored_pet(self, sidx):
+        if not (0 <= sidx < len(self.stored)):
+            return
+        pd = self.stored[sidx]
+        price = self._market_price("pet", pd)
+        if self.market.post(market.make_offer(self.player_id, self.player_name,
+                                              price, "pet", pd)):
+            self.stored.pop(sidx)
+            sound.play("eat")
+            self.show_bubble(f"ลงขายน้องในตลาด ราคา {price} 🪙")
+            self._save_progress()
+
+    def _market_buy(self, offer_id):
+        offer = self.market.remove(offer_id)         # จองรายการ (atomic)
+        if offer is None:
+            self.show_bubble("รายการนี้ถูกซื้อไปแล้ว!")
+            self._show_market_window()
+            return
+        if offer.get("seller_id") == self.player_id:  # ของตัวเอง = เอาคืน
+            self._market_receive(offer)
+            self.show_bubble("เอาของกลับคืนแล้ว")
+            self._save_progress()
+            self._show_market_window()
+            return
+        if self.coins < offer["price"]:
+            self.market.post(offer)                   # ซื้อไม่ได้ → คืนรายการ
+            self.show_bubble("เหรียญไม่พอซื้อ! 🪙")
+            sound.play("hurt")
+            return
+        self.coins -= offer["price"]
+        if not self._market_receive(offer):           # รับไม่ได้ (เต็ม) → คืนเงิน+รายการ
+            self.coins += offer["price"]
+            self.market.post(offer)
+            return
+        sound.play("levelup")
+        self.show_bubble("ซื้อสำเร็จ! 🛒")
+        self._save_progress()
+        self._show_market_window()
+
+    def _market_cancel(self, offer_id):
+        offer = self.market.remove(offer_id)
+        if offer is None:
+            self._show_market_window()
+            return
+        if offer.get("seller_id") != self.player_id:  # ไม่ใช่ของเรา ห้ามยกเลิก
+            self.market.post(offer)
+            return
+        self._market_receive(offer)
+        self.show_bubble("ยกเลิกรายการ เอาของกลับแล้ว")
+        self._save_progress()
+        self._show_market_window()
+
+    def _check_market(self):
+        """จำลอง 'มีคนซื้อ' ของที่เราลงขาย → ได้เหรียญ (เลิกใช้เมื่อต่อ API จริง)"""
+        for o in [x for x in self.market.fetch() if x.get("seller_id") == self.player_id]:
+            if random.random() < config.MARKET_NPC_SELL_CHANCE:
+                claimed = self.market.remove(o["id"])
+                if claimed:
+                    self.add_coins(claimed["price"])
+                    self.show_bubble(f"💰 ขายในตลาดได้! +{claimed['price']} 🪙")
+
+    def _market_row(self, fr, BG, SUB, o, action_label, action, color):
+        rar = config.rarity_by_id(o.get("rarity", "common"))
+        icon = "🐾" if o.get("kind") == "pet" else "🥚"
+        nm = o.get("character") or "เพ็ท"
+        extra = f" Lv.{o['data'].get('level', 1)}" if o.get("kind") == "pet" else ""
+        nsk = len(o.get("data", {}).get("skills", []) or [])
+        row = tk.Frame(fr, bg=BG)
+        row.pack(fill="x", pady=2)
+        tk.Label(row, text=f"{icon} {nm}{extra} {'⭐' * rar['stars']} ⚡{nsk}",
+                 bg=BG, fg=rar["color"], font=("Segoe UI", 10), anchor="w",
+                 width=20).pack(side="left")
+        tk.Label(row, text=f"🪙{o['price']}", bg=BG, fg="#f1c40f",
+                 font=("Segoe UI", 10, "bold")).pack(side="left", padx=4)
+        self._feature_btn(row, action_label, lambda oid=o["id"]: action(oid),
+                          color=color, font=("Segoe UI", 9, "bold"),
+                          padx=8, pady=2).pack(side="right")
+        tk.Label(row, text=o.get("seller_name", ""), bg=BG, fg=SUB,
+                 font=("Segoe UI", 8)).pack(side="right", padx=4)
+
+    def _show_market_window(self):
+        self._seed_npc_offers()
+        win, fr = self._feature_popup(f"🏪  ตลาด        🪙 {self.coins}", back=True)
+        BG, SUB, FG = "#1e1e1e", "#bbbbbb", "#ffffff"
+        offers = self.market.fetch()
+        mine = [o for o in offers if o.get("seller_id") == self.player_id]
+        others = [o for o in offers if o.get("seller_id") != self.player_id]
+        others.sort(key=lambda o: o.get("created_at", 0), reverse=True)
+
+        bar = tk.Frame(fr, bg=BG)
+        bar.pack(fill="x", pady=(2, 6))
+        self._feature_btn(bar, "➕ ลงขายไข่/น้อง", self._market_sell_menu,
+                          color="#2c7a51").pack(side="left")
+        tk.Label(bar, text=f"  ลงขายอยู่ {len(mine)} รายการ", bg=BG, fg=SUB,
+                 font=("Segoe UI", 9)).pack(side="left")
+
+        if mine:
+            tk.Label(fr, text="— ของฉันที่ลงขาย —", bg=BG, fg="#f1c40f",
+                     font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(4, 0))
+            for o in mine[:6]:
+                self._market_row(fr, BG, SUB, o, "ยกเลิก", self._market_cancel, "#7f8c8d")
+        tk.Label(fr, text="— ตลาด (ผู้เล่นอื่น) —", bg=BG, fg="#f1c40f",
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(6, 0))
+        if not others:
+            tk.Label(fr, text="(ยังไม่มีของขาย)", bg=BG, fg=SUB).pack(anchor="w")
+        for o in others[:10]:
+            self._market_row(fr, BG, SUB, o, "ซื้อ", self._market_buy, "#2c7a51")
+        self._center_on_screen(win)
+
+    def _market_sell_menu(self):
+        win, fr = self._feature_popup("➕  ลงขาย — เลือกของ")
+        BG, SUB, FG = "#1e1e1e", "#bbbbbb", "#ffffff"
+        tk.Label(fr, text="เลือกไข่/น้อง(ในกล่อง)ที่จะลงขาย — ราคาแนะนำตามระดับ",
+                 bg=BG, fg=SUB, font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 6))
+        any_item = False
+        if self.eggs:
+            tk.Label(fr, text="🥚 ไข่ในรัง", bg=BG, fg="#f1c40f",
+                     font=("Segoe UI", 9, "bold")).pack(anchor="w")
+            for egg in self.eggs[:8]:
+                any_item = True
+                rar = config.rarity_by_id(egg.get("rarity", "common"))
+                price = self._market_price("egg", egg)
+                row = tk.Frame(fr, bg=BG)
+                row.pack(fill="x", pady=2)
+                tk.Label(row, text=f"🥚 {egg.get('character') or 'เพ็ท'} {'⭐' * rar['stars']}",
+                         bg=BG, fg=rar["color"], font=("Segoe UI", 10), anchor="w",
+                         width=20).pack(side="left")
+                self._feature_btn(row, f"ลงขาย 🪙{price}",
+                                  lambda e=egg: (self._market_list_egg(e),
+                                                 self._show_market_window()),
+                                  color="#2c7a51", font=("Segoe UI", 9, "bold"),
+                                  padx=8, pady=2).pack(side="right")
+        if self.stored:
+            tk.Label(fr, text="🐾 น้องในกล่อง", bg=BG, fg="#f1c40f",
+                     font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(6, 0))
+            for i, pd in enumerate(self.stored[:8]):
+                any_item = True
+                rar = config.rarity_by_id(pd.get("rarity", "common"))
+                price = self._market_price("pet", pd)
+                row = tk.Frame(fr, bg=BG)
+                row.pack(fill="x", pady=2)
+                tk.Label(row, text=f"🐾 {pd.get('name') or pd.get('character') or 'เพ็ท'} "
+                                   f"Lv.{pd.get('level', 1)} {'⭐' * rar['stars']}",
+                         bg=BG, fg=rar["color"], font=("Segoe UI", 10), anchor="w",
+                         width=20).pack(side="left")
+                self._feature_btn(row, f"ลงขาย 🪙{price}",
+                                  lambda idx=i: (self._market_list_stored_pet(idx),
+                                                 self._show_market_window()),
+                                  color="#2c7a51", font=("Segoe UI", 9, "bold"),
+                                  padx=8, pady=2).pack(side="right")
+        if not any_item:
+            tk.Label(fr, text="ไม่มีไข่ในรัง และไม่มีน้องในกล่อง\n(เก็บน้องเข้ากล่องก่อนถึงขายได้)",
+                     bg=BG, fg=SUB, font=("Segoe UI", 10), justify="left").pack(anchor="w", pady=6)
+        self._feature_btn(fr, "‹ กลับตลาด", self._show_market_window,
+                          font=("Segoe UI", 11, "bold"), padx=20, pady=4).pack(pady=(10, 0))
+        self._center_on_screen(win)
 
     # ---------------------------------------------- พาผจญภัย (idle)
     def _is_away(self, pet):
@@ -3759,16 +4901,20 @@ class World:
                           f"(พลัง ×{rar['stat_mult']:.2f})",
                  bg=BG, fg=rar["color"], font=("Segoe UI", 10, "bold")).pack(anchor="w")
 
-        # ── สกิลติดตัว ──
-        sk = self._skill_of(p)
+        # ── สกิลติดตัว (ถือได้หลายสกิล) ──
+        defs = self._pet_skill_defs(p)
         tk.Frame(fr, bg="#3a3f4b", height=1).pack(fill="x", pady=(6, 4))
-        if sk:
-            tlabel = config.SKILL_TYPE_LABEL.get(sk["type"], sk["type"])
-            tcolor = {"attack": "#ff7676", "buff": "#7fd1a0",
-                      "debuff": "#c9a0ff"}.get(sk["type"], FG)
-            tk.Label(fr, text=f"สกิลติดตัว: {sk['emoji']} {sk['name']}  [{tlabel}]",
-                     bg=BG, fg=tcolor, font=("Segoe UI", 11, "bold")).pack(anchor="w")
-            tk.Label(fr, text=f"   {sk['desc']}", bg=BG, fg=SUB,
+        tk.Label(fr, text=f"สกิลติดตัว ({len(defs)}):", bg=BG, fg=FG,
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        tcolor = {"attack": "#ff7676", "defense": "#7fb0ff", "buff": "#7fd1a0",
+                  "debuff": "#c9a0ff"}
+        for sk in defs:
+            kind = "⚡" if self._skill_active(sk) else "🟢"
+            tlabel = config.SKILL_TYPE_LABEL.get(sk.get("type"), sk.get("type", ""))
+            tk.Label(fr, text=f"  {kind} {sk.get('emoji', '')} {sk.get('name', '')}  [{tlabel}]",
+                     bg=BG, fg=tcolor.get(sk.get("type"), FG),
+                     font=("Segoe UI", 10, "bold")).pack(anchor="w")
+            tk.Label(fr, text=f"      {sk.get('desc', '')}", bg=BG, fg=SUB,
                      font=("Segoe UI", 9)).pack(anchor="w")
         tk.Frame(fr, bg="#3a3f4b", height=1).pack(fill="x", pady=(4, 6))
 
@@ -3811,7 +4957,7 @@ class World:
 
     def _show_adventure_window(self):
         """เมนูผจญภัย (คอลัมน์ขวา): ลิสต์ตัวที่ออกไป + ส่งตัวที่ว่างไปได้"""
-        win, fr = self._feature_popup("🧭  ผจญภัย")
+        win, fr = self._feature_popup("🧭  ผจญภัย", back=True)
         BG, SUB, FG = "#1e1e1e", "#bbbbbb", "#ffffff"
 
         def reopen():
@@ -3879,7 +5025,7 @@ class World:
         self._place_window_at_pet(win, pet)
 
     def _show_pets_window(self):
-        win, fr = self._feature_popup(f"👪  น้อง ๆ ({len(self.pets)}/{self._pet_cap()})")
+        win, fr = self._feature_popup(f"👪  น้อง ๆ ({len(self.pets)}/{self._pet_cap()})", back=True)
         BG, SUB, FG = "#1e1e1e", "#bbbbbb", "#ffffff"
         tk.Label(fr, text=f"🪙 {self.coins}   (กดตัวน้องบนจอเพื่อเลือกดูแลก็ได้)",
                  bg=BG, fg=SUB, font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 8))
@@ -3977,17 +5123,38 @@ class World:
                           ).pack(pady=(12, 0))
         self._place_window_beside(win, getattr(self, "_pets_canvas", None))
 
+    def _open_breed_menu(self):
+        """เปิดเมนูผสมพันธุ์จากเมนูหลัก (รีเซ็ตการเลือก + เช็กว่ามีน้องพอ)"""
+        self._breed_a = None
+        if len(self.pets) < 2 and not self.breeding:
+            self.show_bubble("ต้องมีน้องอย่างน้อย 2 ตัวถึงผสมพันธุ์ได้! 👪")
+            return
+        self._show_breed_window()
+
     def _show_breed_window(self):
-        win, fr = self._feature_popup("💕  ผสมพันธุ์")
+        win, fr = self._feature_popup("💕  ผสมพันธุ์", back=True)
         BG, SUB, FG = "#1e1e1e", "#bbbbbb", "#ffffff"
         a = getattr(self, "_breed_a", None)
         if a not in self.pets:
             a = None
             self._breed_a = None
+        _love = f" + รัก ≥ {config.BREED_MIN_AFFECTION}" if config.BREED_MIN_AFFECTION > 0 else ""
         cond = (f"🪙 {config.BREED_COST}   เงื่อนไข: อายุ ≥ {config.BREED_MIN_AGE_DAYS} วัน"
-                f" + รัก ≥ {config.BREED_MIN_AFFECTION}")
+                f"{_love}  ·  ตั้งครรภ์ ~{config.BREED_SECONDS // 60} นาที")
         tk.Label(fr, text=cond, bg=BG, fg=SUB, font=("Segoe UI", 9)
                  ).pack(anchor="w", pady=(2, 2))
+        # งานที่กำลังตั้งครรภ์ (นับถอยหลัง)
+        if self.breeding:
+            tk.Label(fr, text="🤰 กำลังตั้งครรภ์:", bg=BG, fg="#ff8ab0",
+                     font=("Segoe UI", 10, "bold")).pack(anchor="w")
+            now = time.time()
+            for b in self.breeding:
+                left = max(0, int(float(b.get("ready_at", 0)) - now))
+                rr = config.rarity_by_id(b.get("rarity", "common"))
+                txt = "พร้อมคลอด! 🥚" if left <= 0 else f"อีก {left // 60}:{left % 60:02d} น."
+                tk.Label(fr, text=f"   {rr['name']} {'⭐' * rr['stars']} — {txt}",
+                         bg=BG, fg=SUB, font=("Segoe UI", 9)).pack(anchor="w")
+            tk.Frame(fr, bg="#3a3f4b", height=1).pack(fill="x", pady=4)
         tk.Label(fr, text=(f"เลือกตัวที่ 2 (คู่กับ {a.name})" if a else "เลือกพ่อแม่ตัวที่ 1"),
                  bg=BG, fg="#f1c40f", font=("Segoe UI", 10, "bold")
                  ).pack(anchor="w", pady=(0, 6))
@@ -4000,7 +5167,7 @@ class World:
                 first = self._breed_a
                 self._breed_a = None
                 self._breed(first, p)
-                self._show_pets_window()
+                self._show_breed_window()         # กลับมาดูสถานะตั้งครรภ์ที่เพิ่งเริ่ม
 
         for p in self.pets:
             ok = self._can_breed(p) and p is not a
@@ -4036,8 +5203,6 @@ class World:
         """ป๊อปอัปตั้งค่าแบบกำหนดเอง: ธีมเข้ม มี hover เด้งเหนือปุ่ม ⚙"""
         items = [
             ("⚙", "ตั้งค่า", self._show_settings_window, "#2c3e50"),
-            ("🐾", "จัดการตัวละคร", self._show_character_manager, "#2c3e50"),
-            ("🐲", "จัดการมอนสเตอร์", self._show_monster_manager, "#2c3e50"),
             ("🔄", "อัพเดทโปรแกรม", self.update_program, "#2c3e50"),
             ("ℹ", "เกี่ยวกับโปรแกรม", self.show_about, "#2c3e50"),
             ("sep", None, None, None),
@@ -4108,17 +5273,65 @@ class World:
         # มุมขวาล่างของจอหลัก; ใช้ขอบบน taskbar เป็นฐานล่าง (ปุ่มจึงอยู่เหนือ taskbar)
         right = -self.vx0 + self.primary_w
         bottom = self._work_bottom_at(right - margin)
-        bw = 46                                # ปุ่มเมนูใหญ่ขึ้น เห็นชัด
+        bw = 32                                # ขนาดปุ่มเมนู (เล็กลง)
         x1 = max(bw + 4, min(self.sw - 2, (right - margin) + self.hud_offset_x))
         y1 = max(bw + 4, min(self.sh - 2, (bottom - margin) + self.hud_offset_y))
         self.hud_offset_x = x1 - (right - margin)   # เขียนกลับค่าที่ clamp แล้ว
         self.hud_offset_y = y1 - (bottom - margin)
-        self._hud_x1, self._hud_y1 = x1, y1         # เก็บไว้วางป๊อปอัปข้างเมนู
+        self._hud_x1, self._hud_y1, self._hud_bw = x1, y1, bw  # เก็บไว้วางป๊อปอัป/นาฬิกา
         self._hud_handle_rect = (x1 - bw, y1 - bw, x1, y1)
         # มีอะไรรอทำ (เช็คอิน/เควส/ไข่พร้อมฟัก) → โชว์จุดแดงเตือนบนปุ่ม
         alert = (self._can_checkin() or self._any_quest_claimable()
                  or any(self._egg_ready(e) for e in self.eggs))
         self._draw_edge_handle(self._hud_handle_rect, alert)
+
+    def _draw_game_clock(self):
+        """นาฬิกาเข็มของเวลาในเกม + วันที่ — วางเหนือปุ่มเมนู (มุมขวาล่าง)"""
+        self.canvas.delete("gameclock")
+        if not self.show_hud or getattr(self, "hidden_for_fullscreen", False):
+            return
+        if not hasattr(self, "_hud_x1"):
+            return
+        day, hour, minute = self._game_clock()
+        r = 18
+        bw = getattr(self, "_hud_bw", 32)
+        cx = self._hud_x1 - bw / 2                    # กึ่งกลางปุ่มเมนู
+        cy = self._hud_y1 - bw - r - 14              # เหนือปุ่มเมนู
+        night = self._is_night()
+        face = "#2b3550" if night else "#eaf2ff"     # คืน=น้ำเงินเข้ม / วัน=ฟ้าอ่อน
+        hand = "#dfe7ff" if night else "#2c3e50"
+        self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=face,
+                                outline="#5a5a5a", width=2, tags="gameclock")
+        # ขีดบอกชั่วโมง (4 ขีดหลัก)
+        for a in range(0, 360, 90):
+            rad = math.radians(a)
+            self.canvas.create_line(cx + (r - 4) * math.sin(rad), cy - (r - 4) * math.cos(rad),
+                                    cx + r * math.sin(rad), cy - r * math.cos(rad),
+                                    fill="#888", tags="gameclock")
+        # เข็มชั่วโมง + นาที (0° = 12 นาฬิกา, ตามเข็ม)
+        ha = math.radians((hour % 12 + minute / 60.0) * 30)
+        ma = math.radians(minute * 6)
+        self.canvas.create_line(cx, cy, cx + r * 0.5 * math.sin(ha), cy - r * 0.5 * math.cos(ha),
+                                fill=hand, width=3, capstyle="round", tags="gameclock")
+        self.canvas.create_line(cx, cy, cx + r * 0.8 * math.sin(ma), cy - r * 0.8 * math.cos(ma),
+                                fill=hand, width=2, capstyle="round", tags="gameclock")
+        self.canvas.create_oval(cx - 2, cy - 2, cx + 2, cy + 2, fill=hand, outline="",
+                                tags="gameclock")
+        # ป้ายวันที่ + เวลา (ดิจิทัล) เหนือหน้าปัด — โชว์เฉพาะตอนเอาเมาส์ชี้ที่นาฬิกา
+        try:
+            px, py = self.root.winfo_pointerxy()
+            hover = (px - self.vx0 - cx) ** 2 + (py - self.vy0 - cy) ** 2 <= (r + 7) ** 2
+        except Exception:
+            hover = False
+        if hover:
+            label = f"{'🌙' if night else '☀'} วันที่ {day}  {hour:02d}:{minute:02d}"
+            t = self.canvas.create_text(cx, cy - r - 9, text=label, fill="#ffffff",
+                                        font=("Segoe UI", 8, "bold"), tags="gameclock")
+            bb = self.canvas.bbox(t)
+            if bb:
+                bg = self.canvas.create_rectangle(bb[0] - 4, bb[1] - 2, bb[2] + 4, bb[3] + 2,
+                                                  fill="#1e1e1e", outline="", tags="gameclock")
+                self.canvas.tag_lower(bg, t)
 
     def _main_menu_cell(self, parent, emoji, label, cmd, accent=False,
                         sub="", accent_color="#2c7a51"):
@@ -4157,15 +5370,10 @@ class World:
 
     def _show_main_menu(self):
         """เมนูหลัก — เด้งกลางจอ รวมทุกเมนูเกมเป็นกริดเดียว (แทนคอลัมน์ปุ่มด้านขวาเดิม)"""
-        win, fr = self._feature_popup("☰  เมนู")
+        win, fr = self._feature_popup(f"☰  เมนู        🪙 {self.coins}")
         BG, SUB = "#1e1e1e", "#bbbbbb"
         has_pet = bool(self.pets)
-        # ไม่มีน้อง = ไม่โชว์เลเวล
-        head = f"🪙 {self.coins}      🐾 {len(self.pets)}/{self._pet_cap()}"
-        if has_pet:
-            head += f"      Lv.{self.pet.level}"
-        tk.Label(fr, text=head, bg=BG, fg=SUB,
-                 font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 10))
+        tk.Frame(fr, bg=BG, height=8).pack()      # เว้นระยะหัวเมนูกับกริดปุ่ม
 
         def toggle_combat():
             if not has_pet:                       # ไม่มีน้อง = กดต่อสู้ไม่ได้
@@ -4183,6 +5391,9 @@ class World:
              "#c0392b" if self.combat_enabled else "#7f8c8d"),
             ("👪", "น้อง ๆ", self._show_pets_window, len(self.pets) > 1,
              f"{len(self.pets)} ตัว", "#2c7a51"),
+            ("💕", "ผสมพันธุ์", self._open_breed_menu, bool(self.breeding),
+             (f"ตั้งครรภ์ {len(self.breeding)}" if self.breeding else
+              ("จับคู่ได้" if len(self.pets) >= 2 else "ต้องมี 2 ตัว")), "#a0457a"),
             ("🐣", "ฟักไข่", self._show_hatch_window, eggs_ready,
              f"{len(self.eggs)} ฟอง" + (" พร้อม!" if eggs_ready else ""), "#e67e22"),
             ("🧭", "ผจญภัย", self._show_adventure_window, any_away,
@@ -4192,6 +5403,9 @@ class World:
             ("📅", "เช็คอิน", self._show_checkin_window, self._can_checkin(),
              "เช็คอินได้!" if self._can_checkin() else "", "#b8860b"),
             ("🛒", "ร้านค้า", self._show_shop_window, False, "", "#2c7a51"),
+            ("🏪", "ตลาด", self._show_market_window,
+             bool([o for o in self.market.fetch() if o.get("seller_id") == self.player_id]),
+             "ซื้อ-ขายไข่/น้อง", "#8a6d3b"),
             ("🎒", "กระเป๋า", self._show_bag_window, bool(self.inventory),
              "", "#7a6a2c"),
             ("🏆", "ความสำเร็จ", self._show_achievements_window, False, "", "#2c7a51"),
@@ -4327,38 +5541,36 @@ class World:
             self.root.wm_attributes("-topmost", True)  # ย้ำให้อยู่บนสุดเหมือนเดิม
 
     def _draw_monster_hud(self):
-        """บาร์ HP + ตัวเลข HP/ATK ลอยเหนือหัวมอนสเตอร์ (ตามตำแหน่งมอน)"""
+        """บาร์ HP + ตัวเลข HP/ATK ลอยเหนือหัวมอนสเตอร์ทุกตัว (ตามตำแหน่งมอน)"""
         self.canvas.delete("monhud")
-        m = self.monster
-        if m is None:
-            return
-        # บอส: บาร์กว้างกว่า สีทอง / มอนปกติ: บาร์แดง
-        bar_w, bar_h = (96, 9) if m.is_boss else (60, 7)
-        hp_color = "#f1c40f" if m.is_boss else "#e74c3c"
-        cx = m.x
-        y0 = m.top_y() - 16
-        x0 = cx - bar_w / 2
-        ratio = max(0.0, min(1.0, m.hp_ratio()))
-        self.canvas.create_rectangle(x0, y0, x0 + bar_w, y0 + bar_h,
-                                     fill="#3a3a3a", outline="#000000", tags="monhud")
-        self.canvas.create_rectangle(x0, y0, x0 + bar_w * ratio, y0 + bar_h,
-                                     fill=hp_color, outline="", tags="monhud")
-        # ตัวเลข HP / ATK (มีพื้นหลังเข้มให้อ่านง่ายบนทุกฉากหลัง)
-        label = (f"👑 บอส  HP {int(m.hp)}/{m.max_hp}  ATK {m.atk}" if m.is_boss
-                 else f"HP {int(m.hp)}/{m.max_hp}   ATK {m.atk}")
-        txt = self.canvas.create_text(cx, y0 - 9, text=label,
-                                      fill="#ffffff", font=("Segoe UI", 9, "bold"),
-                                      tags="monhud")
-        bx0, by0, bx1, by1 = self.canvas.bbox(txt)
-        pad = 3
-        bg = self.canvas.create_rectangle(bx0 - pad, by0 - pad, bx1 + pad, by1 + pad,
-                                          fill="#222222", outline="", tags="monhud")
-        self.canvas.tag_lower(bg, txt)
+        for m in self.monsters:
+            # บอส: บาร์กว้างกว่า สีทอง / มอนปกติ: บาร์แดง
+            bar_w, bar_h = (96, 9) if m.is_boss else (60, 7)
+            hp_color = "#f1c40f" if m.is_boss else "#e74c3c"
+            cx = m.x
+            y0 = m.top_y() - 16
+            x0 = cx - bar_w / 2
+            ratio = max(0.0, min(1.0, m.hp_ratio()))
+            self.canvas.create_rectangle(x0, y0, x0 + bar_w, y0 + bar_h,
+                                         fill="#3a3a3a", outline="#000000", tags="monhud")
+            self.canvas.create_rectangle(x0, y0, x0 + bar_w * ratio, y0 + bar_h,
+                                         fill=hp_color, outline="", tags="monhud")
+            # ตัวเลข HP / ATK (มีพื้นหลังเข้มให้อ่านง่ายบนทุกฉากหลัง)
+            label = (f"👑 บอส  HP {int(m.hp)}/{m.max_hp}  ATK {m.atk}" if m.is_boss
+                     else f"HP {int(m.hp)}/{m.max_hp}   ATK {m.atk}")
+            txt = self.canvas.create_text(cx, y0 - 9, text=label,
+                                          fill="#ffffff", font=("Segoe UI", 9, "bold"),
+                                          tags="monhud")
+            bx0, by0, bx1, by1 = self.canvas.bbox(txt)
+            pad = 3
+            bg = self.canvas.create_rectangle(bx0 - pad, by0 - pad, bx1 + pad, by1 + pad,
+                                              fill="#222222", outline="", tags="monhud")
+            self.canvas.tag_lower(bg, txt)
 
     def _draw_combat_extras(self):
         """ขณะสู้: วาดเกจเดือด (rage) เหนือหัวน้องทุกตัว — เต็มแล้วปล่อยท่าไม้ตายเอง"""
         self.canvas.delete("rage")
-        if self.monster is None:
+        if not self.monsters:
             return
         for p in self.pets:
             if p.behavior != "fight" or self._is_away(p):
@@ -4377,14 +5589,25 @@ class World:
             if full:                                  # เต็ม = กำลังจะปล่อยท่าเอง
                 self.canvas.create_text(x0 + bw + 8, y0 + bh / 2, text="⚡",
                                         font=("Segoe UI Emoji", 11), tags="rage")
+        # เกจไม้ตายของมอน (เฉพาะตัวที่มีสกิลใช้งาน) — สีม่วงแยกจากของน้อง
+        for m in self.monsters:
+            if not self._monster_has_active(m):
+                continue
+            bw, bh = 44, 5
+            x0 = m.x - bw / 2
+            y0 = m.top_y() - 26
+            self.canvas.create_rectangle(x0 - 1, y0 - 1, x0 + bw + 1, y0 + bh + 1,
+                                         fill="#1e1e1e", outline="#000000", tags="rage")
+            ratio = max(0.0, min(1.0, m.rage / config.RAGE_MAX))
+            self.canvas.create_rectangle(x0, y0, x0 + bw * ratio, y0 + bh,
+                                         fill="#c084fc", outline="", tags="rage")
 
     def _entities(self):
         ents = list(self.pets)
         for p in self.pets:
             if p.food is not None:
                 ents.append(p.food)
-        if self.monster is not None:
-            ents.append(self.monster)
+        ents.extend(self.monsters)
         return ents
 
     def show_about(self):

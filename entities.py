@@ -88,6 +88,19 @@ class Pet(Entity):
         # ── สถานะระหว่างต่อสู้ (ไม่เซฟ) ──
         self.rage = 0              # เกจเดือด (เต็มแล้วปล่อยท่าไม้ตาย)
         self.burn_ttl = 0          # ไฟไหม้เหลือกี่ tick
+        # ระบบป้องกัน/สกิลกดใช้ (active) — โล่ดูดดาเมจ / อมตะ / คูลดาวน์สกิล / กันตายครั้งเดียว
+        self.shield = 0            # โล่ดูดดาเมจคงเหลือ (ลดก่อนเข้า HP)
+        self.invuln_ttl = 0        # อมตะเหลือกี่ tick (รับดาเมจ 0)
+        self.skill_cd = {}         # คูลดาวน์รายสกิลใช้งาน {skill_id: ticks เหลือ}
+        self.last_stand_used = False   # ใช้ "ไม่ยอมตาย" ไปแล้วในรอบนี้หรือยัง
+        # ระบบความเร็วโจมตี/สแต็ก (รำดาบ/พายุคลั่ง/ล็อคเป้า)
+        self.as_stacks = 0         # สแต็กความเร็วโจมตี (รำดาบ Blade Dance)
+        self.as_ttl = 0            # สแต็กความเร็วเหลือกี่ tick ก่อนหมด
+        self.wf_count = 0          # นับหมัด (พายุคลั่ง Windfury — ทุกหมัดที่ N)
+        self.wf_ttl = 0            # บัฟพายุคลั่งเหลือกี่ tick
+        self.focus_target = None   # มอนที่ตีซ้ำ (ล็อคเป้า Focus)
+        self.focus_stacks = 0      # สแต็กดาเมจจากการตีซ้ำเป้าเดิม
+        self.seed_used = False     # ใช้เมล็ดพันธุ์ชีวิต (Life Seed) ไปแล้วในรอบนี้หรือยัง
         self.hp = self.max_hp()
         self.fullness = 80.0
         self.happy = 80.0
@@ -98,11 +111,12 @@ class Pet(Entity):
         self.behavior = "wander"   # wander | stay | goto_food | fight | drag | ko | sleep
         # ── ข้อมูลเฉพาะตัว (ใช้ตอนเลี้ยงหลายตัว) ──
         self.gender = "m"          # เพศ: "m" ผู้ / "f" เมีย (สุ่มตอนเกิด)
-        self.skill = ""            # สกิลติดตัว 1 อย่าง (id จาก config.SKILLS)
+        self.skills = []           # สกิลติดตัว (หลายสกิลได้ จากการผสมพันธุ์) — list ของ id
         self.act_state = ""        # สถานะอนิเมชันแอ็กชันชั่วคราว (อาบน้ำ/ลูบหัว)
         self.act_timer = 0
         self.anim_ms = {}          # หน่วงเฟรมรายสถานะ (state -> ms) จาก pet.json
         self.character = None      # ชื่อตัวละคร (โฟลเดอร์อาร์ต) ของน้องตัวนี้
+        self.range_type = "melee"  # ประเภทการตีปกติ: melee (ประชิด) / ranged (ยิงโปรเจกไทล์)
         self.likes = []            # อาหารที่ชอบ (จาก pet.json)
         self.dislikes = []         # อาหารที่ไม่ชอบ
         # นิสัยประจำตัว (trait) — ค่าผลถูกตั้งโดย game._apply_trait
@@ -126,6 +140,11 @@ class Pet(Entity):
         self.attack_cd = 0
         self._atk_hit = False      # ปล่อยหมัดของสวิงนี้ไปแล้วหรือยัง (กันตีซ้ำในสวิงเดียว)
         self.ko_timer = 0
+
+    @property
+    def skill(self):
+        """สกิลแรก (เพื่อความเข้ากันได้กับโค้ดที่อ้าง .skill เดี่ยว)"""
+        return self.skills[0] if self.skills else ""
 
     def rebirth_mult(self):
         """ตัวคูณถาวรจากการรีบอร์น (ใช้กับ ATK/HP)"""
@@ -180,9 +199,32 @@ class Monster(Entity):
         self.atk = config.MONSTER_ATTACK   # ดาเมจของมอนตัวนี้ (ตั้งจริงตอนเกิด)
         self.is_boss = False               # เป็นบอสประจำเวฟหรือไม่
         self.attack_cd = 0
+        # ── ระดับ/ประเภทการตี/สกิล (กำหนดต่อมอนใน manager) ──
+        self.rarity = "common"             # ระดับความหายาก → ตัวคูณ HP/ATK
+        self.range_type = "melee"          # melee (ประชิด) / ranged (ยิงโปรเจกไทล์ใส่น้อง)
+        self.skill = ""                    # สกิลที่ถูกกำหนดให้ ("" = ไม่มีสกิล)
+        # ── สถานะป้องกัน/สกิล active ของมอน ──
+        self.shield = 0                    # โล่ดูดดาเมจ (สกิลบาเรีย)
+        self.invuln_ttl = 0                # อมตะเหลือกี่ tick
+        self.rage = 0                      # เกจไม้ตาย (เฉพาะมอนที่มีสกิลใช้งาน) → ปล่อยสกิล active
+        self.skill_cd = 0                  # คูลดาวน์สกิลใช้งานของมอน (ticks)
+        self.last_stand_used = False
         self.stun_ttl = 0                  # โดนท่าไม้ตาย/แช่แข็งสตัน เหลือกี่ tick (นิ่ง)
         self.poison_ttl = 0                # ติดพิษเหลือกี่ tick
         self.poison_dmg = 0                # ดาเมจพิษต่อ tick
+        self.bleed_ttl = 0                 # เลือดไหล (bleed) เหลือกี่ tick
+        self.bleed_dmg = 0                 # ดาเมจเลือดไหลต่อวินาที (จาก on_hit/bleed)
+        self.armor = 0.0                   # เกราะ (ลดดาเมจ 0..1) — บอสมีติดตัว
+        self.armor_shred = 0.0             # เกราะถูกทำลาย (ทำลายเกราะ/กรด) ลดเกราะจริง
+        self.doom_ttl = 0                  # คำสาปสั่งตาย/ระเบิดเวลา นับถอยหลังกี่ tick
+        self.doom_dmg = 0                  # ดาเมจตอนคำสาปครบกำหนด
+        self.plague = False                # ติดโรคระบาด → ตายแล้วแพร่พิษใส่ตัวข้าง ๆ
+        self.slow_ttl = 0                  # ถูกลดความเร็ว (slow) เหลือกี่ tick
+        self.slow_pct = 0.0                # ลดความเร็ว/รอบโจมตีกี่ส่วน (0.4 = ช้าลง 40%)
+        self.vuln_ttl = 0                  # ติดคำสาป/เปราะ (vulnerable) เหลือกี่ tick
+        self.vuln_pct = 0.0                # รับดาเมจเพิ่มกี่ส่วน (0.15 = +15%)
+        self.blind_ttl = 0                 # ตาบอด (โจมตีมีโอกาสพลาด) เหลือกี่ tick
+        self.blind_miss = 0.0              # โอกาสพลาดตอนตาบอด
 
     def hp_ratio(self):
         return max(0.0, self.hp) / self.max_hp
@@ -191,3 +233,28 @@ class Monster(Entity):
 class Food(Entity):
     def __init__(self, canvas, anims, x, y):
         super().__init__(canvas, anims, x, y, state="idle")
+
+
+class Projectile:
+    """ลูกกระสุนของการตีปกติแบบ ranged — วาดเป็นวงกลมเล็ก เลื่อนเข้าหาเป้าทุก tick
+    ข้อมูลเป้า/ผู้ยิง/บัฟทีม (target/pet/team) ถูกตั้งจากฝั่ง game หลังสร้าง"""
+
+    def __init__(self, canvas, x, y, color="#ffd23f", r=7):
+        self.canvas = canvas
+        self.x = float(x)
+        self.y = float(y)
+        self.r = r
+        self.source = "pet"        # ผู้ยิง: "pet" (ยิงใส่มอน) หรือ "monster" (ยิงใส่น้อง)
+        self.target = None         # เป้าที่กำลังพุ่งเข้าหา
+        self.pet = None            # น้องผู้ยิง (ใช้คิดดาเมจตอนโดน)
+        self.monster = None        # มอนผู้ยิง (กรณี source=monster)
+        self.team = None           # บัฟทีม ณ ตอนยิง
+        self.item = canvas.create_oval(x - r, y - r, x + r, y + r,
+                                       fill=color, outline="#aa7700")
+
+    def move_to(self, x, y):
+        self.x, self.y = x, y
+        self.canvas.coords(self.item, x - self.r, y - self.r, x + self.r, y + self.r)
+
+    def destroy(self):
+        self.canvas.delete(self.item)
